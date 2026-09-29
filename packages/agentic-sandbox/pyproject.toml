@@ -1,0 +1,33 @@
+[project]
+name = "genai-agentic-sandbox"
+version = "0.1.0"
+description = "Agent that plans and executes code inside an isolated sandbox"
+readme = "README.md"
+authors = [
+    { name = "gh-aswanth", email = "aswanth.babu@outlook.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "deepagents>=0.7.19",
+    "docker>=7.2.0",
+    "langchain>=1.4.3",
+    "langchain-mcp-adapters>=0.3.2",
+    "langchain-openai>=1.6.6",
+    "langgraph>=1.2.12",
+    "langgraph-checkpoint-postgres>=3.1.2",
+    "packaging>=26.3",
+    "python-dotenv>=1.2.3",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.13,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "python-docx>=1.2.0",
+]
+
+[project.scripts]
+genai-agentic-sandbox = "genai_agentic_sandbox.main:main"
+sandbox-build = "genai_agentic_sandbox.builder:main"

@@ -1,0 +1,20 @@
+# Dependencies baked into the default sandbox image.
+#
+# This is NOT a workspace member: `SandboxImageBuilder` copies it into the image
+# as `pyproject.toml` and installs `[project].dependencies` into /opt/venv, the
+# Python the agent's commands run with. Edit the list, rebuild, and the image tag
+# changes with it (tags are a hash of this file + the generated Dockerfile).
+
+[project]
+name = "sandbox-runtime"
+version = "0.1.0"
+requires-python = ">=3.14"
+dependencies = [
+    # data work: jobs.json merging, skill counting, scoring
+    "numpy",
+    "pandas",
+    "matplotlib",
+    # documents: agents read and revise the resume with code they write at run time
+    "python-docx",
+    "lxml",
+]

@@ -1,0 +1,27 @@
+[project]
+name = "genai"
+version = "0.1.0"
+description = "GenAI workflows workspace (LangChain, AutoGen, DSPy, Qdrant, Postgres, Redis)"
+requires-python = ">=3.12"
+# Root depends on every member, so a plain `uv sync` at the root installs everything.
+dependencies = [
+    "genai-agentic-sandbox",
+]
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv.sources]
+genai-agentic-sandbox = { workspace = true }
+
+[dependency-groups]
+dev = ["pytest>=9.1.1", "pytest-asyncio>=1.4.0", "ruff>=0.16.9", "mypy>=2.3.1"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = ["integration: needs live services or a real LLM"]
+addopts = "-m 'not integration'"

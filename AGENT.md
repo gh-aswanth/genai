@@ -33,10 +33,7 @@ genai/
 ├── .env.example              # all env vars used by any package
 ├── docker-compose.yml        # postgres, redis, qdrant for local dev
 └── packages/
-    ├── core/                 # genai-core: settings, LLM factory, db/redis/qdrant clients
-    │   ├── pyproject.toml
-    │   ├── src/genai_core/
-    │   └── tests/
+    ├── agentic-sandbox/      # genai-agentic-sandbox: agent that runs code in a Docker sandbox
     ├── agent-flow/           # genai-agent-flow: LangGraph tool-calling agent
     │   ├── pyproject.toml
     │   ├── README.md
@@ -51,11 +48,12 @@ genai/
 
 ### Planned workflows
 
-Add one package per workflow. Suggested set:
+Add one package per workflow. Each package is **self-contained**: it declares its own
+dependencies and owns its own settings/clients. There is no shared `core` package. Suggested set:
 
 | Folder            | Workflow                                                      | Main libs                      |
 |-------------------|---------------------------------------------------------------|--------------------------------|
-| `core`            | Shared config, clients, logging (no business logic)           | pydantic-settings, sqlalchemy  |
+| `agentic-sandbox` | Agent that writes and executes code in an isolated sandbox     | langgraph, docker              |
 | `rag`             | Chunk → embed → Qdrant → retrieve → rerank → answer           | langchain, qdrant-client       |
 | `agent-flow`      | Tool-calling / ReAct agent, human-in-the-loop, checkpoints    | langgraph, postgres checkpoint |
 | `multi-agent`     | Planner/worker/critic teams, group chat                       | autogen-agentchat              |
@@ -90,7 +88,6 @@ version = "0.1.0"
 requires-python = ">=3.12"
 # Root depends on every member, so a plain `uv sync` at the root installs everything.
 dependencies = [
-    "genai-core",
     "genai-agent-flow",
     # add each new package here
 ]
@@ -99,12 +96,11 @@ dependencies = [
 members = ["packages/*"]
 
 [tool.uv.sources]
-genai-core = { workspace = true }
 genai-agent-flow = { workspace = true }
 # add each new package here
 
 [dependency-groups]
-dev = ["pytest>=8", "pytest-asyncio", "ruff", "mypy", "ipykernel"]
+dev = ["pytest>=9.1.1", "pytest-asyncio>=1.4.0", "ruff>=0.16.9", "mypy>=2.3.1"]
 
 [tool.ruff]
 line-length = 100
@@ -119,17 +115,14 @@ name = "genai-agent-flow"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
-    "genai-core",
-    "langchain",
-    "langgraph",
+    "langchain>=1.4.3",
+    "langchain-openai>=1.6.6",
+    "langgraph>=1.2.12",
 ]
 
-[tool.uv.sources]
-genai-core = { workspace = true }
-
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["uv_build>=0.12.13,<0.13.0"]
+build-backend = "uv_build"
 ```
 
 ## Installing dependencies
@@ -154,7 +147,7 @@ uv sync --package genai-agent-flow
 
 ```bash
 cd packages/agent-flow
-uv sync                  # installs genai-agent-flow + its deps (incl. genai-core) into root .venv
+uv sync                  # installs genai-agent-flow + its deps into root .venv
 uv sync --inexact        # same, but keeps the other packages already installed in .venv
 uv run pytest
 ```
@@ -172,7 +165,7 @@ Example: starting the agent flow.
 uv init --lib packages/agent-flow --name genai-agent-flow
 # creates packages/agent-flow/pyproject.toml + src/genai_agent_flow/ (already a member via packages/*)
 
-uv add --package genai-agent-flow genai-core langchain langgraph
+uv add --package genai-agent-flow langchain langchain-openai langgraph
 # then add it to the root pyproject: dependencies + [tool.uv.sources] (workspace = true)
 uv sync
 ```
@@ -180,8 +173,7 @@ uv sync
 Checklist for every new package:
 
 1. `pyproject.toml` with name `genai-<name>`, src layout, `tests/` folder.
-2. Depends on `genai-core` via `{ workspace = true }` for config and clients — do not
-   re-implement connection code.
+2. Declares **all** of its own runtime dependencies (no shared core package).
 3. Registered in the root `pyproject.toml` (`dependencies` + `[tool.uv.sources]`).
 4. A short `README.md` explaining the workflow, how to run it, and required env vars.
 5. New env vars added to the root `.env.example`.
@@ -227,11 +219,12 @@ cp .env.example .env
 
 ## Configuration
 
-- All settings are loaded in `genai-core` via `pydantic-settings` from environment / `.env`.
+- Each package loads its own settings (e.g. a `settings.py` using `pydantic-settings`) from
+  environment / `.env`.
 - Expected variables (extend in `.env.example`):
   `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `LLM_PROVIDER`, `LLM_MODEL`, `EMBEDDING_MODEL`,
   `POSTGRES_DSN`, `REDIS_URL`, `QDRANT_URL`, `QDRANT_API_KEY`.
-- Never hard-code keys, URLs or model names in workflow packages; read them from `genai_core.settings`.
+- Never hard-code keys, URLs or model names in workflow packages; read them from the package's settings module.
 - Never commit `.env`.
 
 ## Code guidelines
@@ -242,8 +235,8 @@ cp .env.example .env
   (inject the model / use fakes in tests).
 - Tests that need Postgres/Redis/Qdrant or a real LLM are marked `@pytest.mark.integration`
   and skipped by default.
-- Packages must not import from each other except `genai-core` (or an explicitly declared
-  workspace dependency).
+- Packages are independent: they must not import from each other unless the dependency is
+  explicitly declared (`{ workspace = true }`).
 - Format and lint with `ruff`; code must pass `ruff check` and `mypy` before commit.
 
 ## Agent do / don't
