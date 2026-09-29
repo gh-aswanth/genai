@@ -60,9 +60,8 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from typing import Any
 
-from deepagents import create_deep_agent
+from deepagents import CompiledSubAgent, SubAgent, create_deep_agent
 from deepagents.backends.protocol import SandboxBackendProtocol
-from deepagents.middleware.subagents import CompiledSubAgent, SubAgent
 from deepagents.middleware.summarization import create_summarization_tool_middleware
 from langchain.agents.middleware import AgentMiddleware, TodoListMiddleware
 from langchain_core.language_models import BaseChatModel
@@ -276,33 +275,35 @@ def build_subagents(
     orchestrator keeps ats-reviewer for the score-only workflow.
     """
     mw = _middleware_factory(model, backend, cache_retention, memory)
+    job_search: SubAgent = {
+        "name": "job-search",
+        "description": (
+            "Finds current job postings on the web with a real browser (Playwright). "
+            "Give it the role, location, seniority, sites/URLs, count and date limits. "
+            "Saves normalised jobs to /output/jobs/jobs.json."
+        ),
+        "system_prompt": JOB_SEARCH_PROMPT,
+        "tools": list(browser_tools),
+        "skills": JOB_SEARCH_SKILLS,
+        # browser files stay in the captures folder, never elsewhere on the host
+        "middleware": [*mw("job-search"), BrowserFileGuardMiddleware()],
+    }
+    job_matcher: SubAgent = {
+        "name": "job-matcher",
+        "description": (
+            "Matches the resume against /output/jobs/jobs.json: scores each job, does an "
+            "ATS review, selects the best N jobs and writes a separate change list for "
+            "each (required skills, keywords, rewrites). Writes "
+            "/output/match/match_report.json and .md. Give it the resume path and N."
+        ),
+        "system_prompt": JOB_MATCHER_PROMPT,
+        "tools": [],
+        "skills": JOB_MATCHER_SKILLS,
+        "middleware": mw("job-matcher"),
+    }
     return [
-        {
-            "name": "job-search",
-            "description": (
-                "Finds current job postings on the web with a real browser (Playwright). "
-                "Give it the role, location, seniority, sites/URLs, count and date limits. "
-                "Saves normalised jobs to /output/jobs/jobs.json."
-            ),
-            "system_prompt": JOB_SEARCH_PROMPT,
-            "tools": list(browser_tools),
-            "skills": JOB_SEARCH_SKILLS,
-            # browser files stay in the captures folder, never elsewhere on the host
-            "middleware": [*mw("job-search"), BrowserFileGuardMiddleware()],
-        },
-        {
-            "name": "job-matcher",
-            "description": (
-                "Matches the resume against /output/jobs/jobs.json: scores each job, does an "
-                "ATS review, selects the best N jobs and writes a separate change list for "
-                "each (required skills, keywords, rewrites). Writes "
-                "/output/match/match_report.json and .md. Give it the resume path and N."
-            ),
-            "system_prompt": JOB_MATCHER_PROMPT,
-            "tools": [],
-            "skills": JOB_MATCHER_SKILLS,
-            "middleware": mw("job-matcher"),
-        },
+        job_search,
+        job_matcher,
         build_job_optimizer(
             model,
             backend,
