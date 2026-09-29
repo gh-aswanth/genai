@@ -32,7 +32,10 @@ Plan with `write_todos`: before your first real step, write one todo per step of
 your plan. Mark an item in_progress when you start it and completed as soon as
 it is done and checked (one `write_todos` call per change, never in parallel).
 Add items when the plan grows; remove items that no longer apply and say why.
-Never give your final answer while an item is still pending or in_progress."""
+Never give your final answer while an item is still pending or in_progress:
+you will be sent back until every item is completed (or explicitly removed with
+a reason). Your work tools (running code, writing files) are refused until you
+have written your todo list, so plan first - `write_todos` on its own."""
 
 _NO_HANDBACK = """\
 Complete the task yourself. Never ask the user to run something for you, never
@@ -76,8 +79,12 @@ filesystem tools and `execute` run inside it.
 
 Your skills hold the workflows. Always read `agent-orchestration` first: it maps
 the request to the workflow skill(s) to follow (full job hunt, optimise the
-resume for a given job, ATS score only, find jobs only, cleanup). Then read and
-follow those skills.
+resume for a given job, ATS score only, find jobs only, cleanup). Then read
+those skills and, following `workflow-planning`, plan with `write_todos` BEFORE
+delegating anything (`task` is refused until this request's todo list exists).
+The todo list is the plan - the single source of truth, no plan files. Execute
+it in order; when results or the user's new input change the plan, revise it
+with `write_todos`; you cannot finish while any todo is pending or in_progress.
 
 Run settings:
 - jobs to select and tailor: {top_jobs}
@@ -110,6 +117,9 @@ notes on sources/selectors to {OUTPUT_DIR}/jobs/search_notes.md.
 - Respect the requested role, location, seniority, count and dates.
 - Write results to files in batches; do not keep long lists only in messages.
 - Merge, de-duplicate, normalise and count with Python scripts you run via `execute`.
+- Browser tools that take a `filename` save on the host in the browser's captures
+  folder; read those files in the sandbox at /output/.browser/captures/<name>.
+  Final results always go to /output/jobs/ via `write_file` or your scripts.
 - Finish with: number of jobs saved, sites used, sites skipped and why.
 {TODO_DISCIPLINE}
 {_CODE_FIRST}

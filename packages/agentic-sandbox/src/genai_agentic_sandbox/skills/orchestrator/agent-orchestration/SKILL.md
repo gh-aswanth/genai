@@ -19,24 +19,30 @@ the next step, and report.
 | only find jobs | `jobhunt-workflow`, step 1 only (no cleanup - jobs.json is the result) |
 | clean up the output folder | `output-cleanup` |
 
-Every workflow also uses `agent-memory`: read memory at the start, save what
-the user tells you as it happens, curate subagents' "Memory notes" at the end
+Every workflow starts with `workflow-planning` (write the plan to disk, then
+execute it) and uses `agent-memory`: read memory at the start, save what the
+user tells you as it happens, curate subagents' "Memory notes" at the end
 (before `output-cleanup`).
 
 Unclear between "score" and "optimise"? Scoring never edits: if the user did not
 ask for changes, run `ats-score-only`. Read the chosen skill(s) before planning.
 
-## 2. Plan as todos - and finish them
+## 2. Plan on disk, mirror it as todos - and finish them
 
-1. Call `write_todos` BEFORE the first delegation, one item per concrete step of
-   the chosen workflow, e.g. "job-search: 25 python jobs in Kochi -> jobs.json",
-   "round 1 builder for job 1", "round 1 ATS review for job 1".
+Follow `workflow-planning`: your todo list is the plan - the single source of
+truth, no plan files (`task` is refused until this request's todos exist):
+
+1. Call `write_todos` BEFORE the first delegation, one item per step of the
+   plan, same order and numbering, e.g. "1. job-search: 25 python jobs in Kochi
+   -> jobs.json", "3. round 1 builder for job 1".
 2. Mark an item `in_progress` when you start it, `completed` right after its
    output is verified - one `write_todos` call per change, never in parallel.
-3. Add items when the plan grows (another round), remove ones that no longer
-   apply (loop stopped early) - saying why in your next message.
-4. Do not give the final answer while any item is open. (A check enforces this:
-   you will be sent back with the list of open items.)
+3. Change the plan only through `write_todos`: add items when it grows (another
+   round), remove ones that no longer apply (loop stopped early), and apply the
+   user's new instructions to the pending items - saying what changed and why.
+4. Do not give the final answer while any item is open. A check enforces this:
+   every attempt to finish with open items sends you back with the list, until
+   each one is completed or removed with a reason.
 
 ## 3. Brief subagents
 

@@ -185,9 +185,30 @@ def test_disable_is_idempotent():
 # -- what OpenAI receives --------------------------------------------------------------
 
 
+def tool_reply(name: str, args: dict, call_id: str) -> dict:
+    return completion(
+        {
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": json.dumps(args)},
+                }
+            ],
+        }
+    )
+
+
 def test_each_agent_sends_its_own_cache_key():
     fake = FakeOpenAI(
         [
+            # plan first: `task` is refused until this request's todos exist
+            tool_reply(
+                "write_todos",
+                {"todos": [{"content": "1. score", "status": "in_progress"}]},
+                "call_0",
+            ),
             completion(
                 {
                     "content": None,
@@ -206,6 +227,10 @@ def test_each_agent_sends_its_own_cache_key():
                 }
             ),
             completion({"content": "sub-agent done"}),  # ats-reviewer
+            # complete the todo before answering
+            tool_reply(
+                "write_todos", {"todos": [{"content": "1. score", "status": "completed"}]}, "call_2"
+            ),
             completion({"content": "all done"}),  # orchestrator
         ]
     )
@@ -214,7 +239,13 @@ def test_each_agent_sends_its_own_cache_key():
     )
     assert result["messages"][-1].content == "all done"
     keys = [b.get("prompt_cache_key") for b in fake.bodies]
-    assert keys == ["jobhunter:orchestrator", "jobhunter:ats-reviewer", "jobhunter:orchestrator"]
+    assert keys == [
+        "jobhunter:orchestrator",  # plans (todos)
+        "jobhunter:orchestrator",  # delegates
+        "jobhunter:ats-reviewer",
+        "jobhunter:orchestrator",  # completes the todo
+        "jobhunter:orchestrator",  # answers
+    ]
     assert all(b.get("prompt_cache_retention") == "24h" for b in fake.bodies)
     assert "cache_control" not in json.dumps(fake.bodies)  # no Anthropic markers
 

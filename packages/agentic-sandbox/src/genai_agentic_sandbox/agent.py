@@ -22,10 +22,14 @@ so those are configured, not added again. Added explicitly to the main agent and
 every subagent:
 
 - `TodoListMiddleware`    (`write_todos` planning; not in the default stack)
-- `TodoCompletionMiddleware` (ours: an agent that tries to finish with open
-  todos is sent back to finish or close them)
+- `TodoCompletionMiddleware` (ours: the work tools of each agent are refused
+  until it has planned with `write_todos` in this request, and it is sent back
+  every time it tries to finish while a todo is still open)
 - `create_summarization_tool_middleware` (`compact_conversation` tool; shares
   state with the automatic summarization)
+
+Planning is the todo list - the single source of truth, no plan files (skill
+`workflow-planning`). See `PLAN_BEFORE` for which tools need a plan first.
 
 Skills: the orchestrator (main agent) has the workflow skills under
 /skills/orchestrator/ (agent-orchestration, jobhunt-workflow,
@@ -68,7 +72,12 @@ from genai_agentic_sandbox.caching import (
     OpenAIPromptCachingMiddleware,
     disable_anthropic_prompt_caching,
 )
-from genai_agentic_sandbox.memory import AGENT_NOTES, USER_PROFILE, subagent_memory
+from genai_agentic_sandbox.memory import (
+    AGENT_NOTES,
+    USER_PROFILE,
+    MemoryGuardMiddleware,
+    subagent_memory,
+)
 from genai_agentic_sandbox.middleware import TodoCompletionMiddleware
 from genai_agentic_sandbox.prompts import (
     ATS_REVIEWER_PROMPT,
@@ -79,6 +88,7 @@ from genai_agentic_sandbox.prompts import (
     RESUME_BUILDER_PROMPT,
     jobhunter_prompt,
 )
+from genai_agentic_sandbox.tools.browser import BrowserFileGuardMiddleware
 
 SKILLS_MOUNT = "/skills"
 MAIN_SKILLS = [f"{SKILLS_MOUNT}/orchestrator/"]
@@ -94,6 +104,16 @@ SUBAGENT_MEMORY = {
     "job-matcher": [USER_PROFILE],
     "resume-builder": [USER_PROFILE],
     "ats-reviewer": [],
+}
+
+
+# Tools that do the real work: refused until the agent planned with write_todos.
+PLAN_BEFORE = {
+    "orchestrator": ("task",),
+    "job-search": ("execute", "write_file", "edit_file", "browser_navigate"),
+    "job-matcher": ("execute", "write_file", "edit_file"),
+    "resume-builder": ("execute", "write_file", "edit_file"),
+    "ats-reviewer": ("execute", "write_file", "edit_file"),
 }
 
 
@@ -115,9 +135,12 @@ def extra_middleware(
     """
     stack: list[AgentMiddleware] = [
         TodoListMiddleware(),
-        TodoCompletionMiddleware(),
+        # Plan with todos before working; finish only when every todo is completed.
+        TodoCompletionMiddleware(plan_before=PLAN_BEFORE.get(agent, ())),
         create_summarization_tool_middleware(model, backend),
         OpenAIPromptCachingMiddleware(agent, retention=cache_retention),
+        # Memory is never deleted; subagents may not write it at all.
+        MemoryGuardMiddleware(read_only=agent != "orchestrator"),
     ]
     if memory:
         stack.append(subagent_memory(backend, memory))
@@ -156,7 +179,8 @@ def build_subagents(
             "system_prompt": JOB_SEARCH_PROMPT,
             "tools": list(browser_tools),
             "skills": JOB_SEARCH_SKILLS,
-            "middleware": mw("job-search"),
+            # browser files stay in the captures folder, never elsewhere on the host
+            "middleware": [*mw("job-search"), BrowserFileGuardMiddleware()],
         },
         {
             "name": "job-matcher",
@@ -263,6 +287,7 @@ __all__ = [
     "JOB_SEARCH_SKILLS",
     "MAIN_MEMORY",
     "MAIN_SKILLS",
+    "PLAN_BEFORE",
     "RESUME_BUILDER_SKILLS",
     "SKILLS_MOUNT",
     "SUBAGENT_MEMORY",

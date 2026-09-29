@@ -23,6 +23,7 @@ EXPECTED_SKILLS = {
     "job-posting-intake",
     "output-cleanup",
     "agent-memory",
+    "workflow-planning",
 }
 CLEANUP = skill_code((ORCH / "output-cleanup" / "SKILL.md").read_text(), "cleanup reference")
 REPORT = skill_code((ORCH / "ats-score-only" / "SKILL.md").read_text(), "ats-report reference")
@@ -45,6 +46,18 @@ def test_score_only_never_edits():
     assert 'mode "score-only"' in text
     reviewer = (SKILLS_DIR / "ats" / "ats-scoring" / "SKILL.md").read_text()
     assert 'mode "score-only"' in reviewer and "`n/a`" in reviewer
+
+
+def test_the_todo_list_is_the_only_plan():
+    """No plan files anywhere: the todo list is the single source of truth."""
+    planning = (ORCH / "workflow-planning" / "SKILL.md").read_text()
+    assert "single source of truth" in planning and "write_todos" in planning
+    assert "the user adds or changes something" in planning  # plan changes from user input
+    for skill in SKILLS_DIR.glob("*/*/SKILL.md"):
+        text = skill.read_text()
+        assert "plan.md" not in text and "progress.md" not in text and "/output/plan" not in text, (
+            skill
+        )
 
 
 def test_every_workflow_plans_with_todos():
@@ -77,8 +90,16 @@ WORK_FILES = [
     "resume/1-acme-backend/ats/round-1.json",
     "resume/1-acme-backend/ats/ats_score.py",
     "ats/general/round-1.json",
+    "resume/1-acme-backend/~$ne Resume_acme-backend_final.docx",  # Word lock file
+    ".browser/captures/page.png",  # browser output is agent output too
+    ".browser/captures/listings_extract.json",
 ]
-PROTECTED = ["original/Jane Resume.docx", ".browser/profile/Cookies", ".browser/captures/page.png"]
+PROTECTED = [
+    "original/Jane Resume.docx",
+    ".browser/profile/Cookies",
+    "memories/user_profile.md",
+    "memories/agent_notes.md",
+]
 
 
 @pytest.fixture
@@ -164,6 +185,7 @@ def test_deliverable_patterns_are_strict():
         "resume/cv_final.docx",
         "jobs/cv_final.docx",
         "ats/general/ats_report.docx",
+        "resume/1-x/~$_x_final.docx",  # Word lock file
     ]
     assert all(any(p.match(r) for p in patterns) for r in ok)
     assert not any(any(p.match(r) for p in patterns) for r in bad)

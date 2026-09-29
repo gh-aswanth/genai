@@ -193,6 +193,8 @@ what to do (`suggestion`):
 - keywords the experience supports but never names (category `keyword`)
 - a missing Summary/Skills that the resume's own content could fill
   (category `missing_info`) - facts not in the resume are `ask_user`
+- mixed fonts or sizes in body text (added text that looks different from the rest)
+  (category `format`) - quote the text in the odd font
 - anything that still reads generic for THIS job
 
 Quality issues do not change the script's `score` (keep it reproducible);

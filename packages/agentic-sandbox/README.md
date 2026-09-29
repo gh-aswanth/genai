@@ -31,7 +31,7 @@ uv run genai-agentic-sandbox --resume ~/cv.docx     # interactive session
 ```
 
 Options: `--top-jobs N` (default 2), `--target-score` (85), `--max-rounds` (3),
-`--keep-work-files`, `--memory-dir` (`~/.jobhunter/memory`), `--no-memory`,
+`--keep-work-files`, `--memory-dir` (default `<out>/memories`), `--no-memory`,
 `--prompt-cache-retention {in_memory,24h}`, `--model`, `--headed`, `--no-verify`.
 
 Your resume is never modified. Before anything runs it is checked (a .docx with
@@ -42,6 +42,7 @@ real text - a blank document is rejected with an error), copied to
 ```
 jobhunt-output/
 ├── original/<your resume>.docx            read-only copy
+├── memories/user_profile.md, agent_notes.md   long-term memory (never deleted)
 ├── jobs/jobs.json                          found jobs
 ├── match/match_report.{json,md}            scores, ATS review, selected_jobs
 └── resume/<rank>-<company-role>/           one folder per selected job
@@ -64,7 +65,12 @@ in the separate redline copy; Reject All on the review copy restores your
 original exactly.
 
 What the sandbox container sees: the resume copy (read-only), `/output`
-(read-write -> `--out`), `/skills` (read-only). No network. The browser
+(read-write -> `--out`), `/skills` (read-only). The browser (Playwright MCP) is the only
+part on the host, and it is confined: it runs in `<out>/.browser/captures/`
+(files it saves land there and are readable in the sandbox at
+`/output/.browser/captures/`), every `filename` is reduced to a plain name in that
+folder, and the tools that could read host files or run host code
+(`browser_file_upload`, `browser_drop`, `browser_run_code_unsafe`) are not loaded. No network. The browser
 runs on the host through Playwright MCP and only the job-search subagent has it.
 
 ## Workflows (the orchestrator's skills)
@@ -84,10 +90,33 @@ request, and follows the matching workflow skill (`skills/orchestrator/`):
 keeping only the .docx deliverables; pass `--keep-work-files` to keep scripts,
 JSON, round folders and logs.
 
+## Planning: todos, completed to the end
+
+Every agent plans with `write_todos` and must finish its list
+(`TodoCompletionMiddleware`, `middleware.py`):
+
+- **Plan first** - the tools that do the real work are refused until the agent
+  has written its todo list in the current request: `task` for the
+  orchestrator; `execute` / `write_file` / `edit_file` (and `browser_navigate`
+  for job-search) for subagents. Reading and inspecting are always allowed.
+- **Finish every todo** - an agent that tries to answer while an item is
+  pending or in_progress is sent back with the open items, every time, until
+  each is completed or explicitly removed with a reason (safety cap: 10).
+- Both reset per request, so an old completed list never counts as a new plan.
+
+The todo list is the plan - the single source of truth, no plan files (skill
+`workflow-planning`). The orchestrator revises it with `write_todos` whenever
+results or your new input change the plan; the terminal shows it live.
+
 ## Memory
 
-Two Markdown files in `~/.jobhunter/memory` (mounted at `/memories`) survive
-between runs; `output-cleanup` never touches them:
+Two Markdown files in the visible folder `<out>/memories/` (e.g.
+`jobhunt-output/memories/`, mounted at `/memories`) survive between runs and are
+never deleted: `output-cleanup` protects the folder, a guard middleware refuses
+any `delete` or shell command that would remove, move or wipe it (including
+`rm -rf /output`), and subagents cannot write to it at all. Memory from the old
+hidden `~/.jobhunter/memory` is copied in on the first run. Each run prints the
+memory files at the start and the end.
 
 | File | Holds | Loaded by |
 |---|---|---|
@@ -141,11 +170,11 @@ src/genai_agentic_sandbox/
 ├── prompts.py         # prompts and the /output file contract
 ├── middleware.py      # TodoCompletionMiddleware
 ├── caching.py         # OpenAI prompt caching; Anthropic caching removed
-├── memory.py          # long-term memory files, seeding, subagent memory
+├── memory.py          # long-term memory files, seeding, subagent memory, guard
 ├── skills/            # SKILL.md files, mounted at /skills
 │   ├── orchestrator/  # main agent: agent-orchestration, jobhunt-workflow,
 │   │                  # resume-optimization, ats-score-only, job-posting-intake,
-│   │                  # output-cleanup, agent-memory
+│   │                  # output-cleanup, agent-memory, workflow-planning
 │   ├── search/web-job-search/
 │   ├── matching/ats-resume-review/
 │   ├── resume/docx-tracked-revisions/

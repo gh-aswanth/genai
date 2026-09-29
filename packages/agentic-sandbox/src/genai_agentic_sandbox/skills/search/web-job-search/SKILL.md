@@ -28,6 +28,11 @@ Skip a site that demands login or shows a CAPTCHA - note it and move on.
 
 Never pass invented arguments to a tool. Leave a second or two between page loads.
 
+Big results: pass `filename` to `browser_evaluate` (a plain name like
+`listing-p2.json`) - it is saved in the browser's captures folder and readable
+in the sandbox at `/output/.browser/captures/<name>`; merge it into
+`/output/jobs/` with a script. Never pass directories or absolute paths.
+
 ## Step 1 - look at the page
 
 ```js

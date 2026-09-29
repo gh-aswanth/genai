@@ -96,7 +96,7 @@ def test_every_change_ok_and_every_check_true(outputs):
     status = [line for line in lines if line.startswith(("OK", "FAIL"))]
     assert len(status) == 11 and all(s.startswith("OK") for s in status), status
     checks = [line for line in lines if line.startswith("CHECK")]
-    assert len(checks) == 4 and all(c.endswith("True") for c in checks), checks
+    assert len(checks) == 5 and all(c.endswith("True") for c in checks), checks
 
 
 # -- review copy (tracked) -----------------------------------------------------------

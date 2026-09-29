@@ -22,8 +22,10 @@ from genai_agentic_sandbox.agent import (
 )
 from genai_agentic_sandbox.caching import OpenAIPromptCachingMiddleware
 from genai_agentic_sandbox.main import SKILLS_DIR
+from genai_agentic_sandbox.memory import MemoryGuardMiddleware
 from genai_agentic_sandbox.middleware import TodoCompletionMiddleware
 from genai_agentic_sandbox.sandbox.docker import DockerSandboxBackend
+from genai_agentic_sandbox.tools.browser import BrowserFileGuardMiddleware
 from langchain.agents.middleware import TodoListMiddleware
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
@@ -73,6 +75,7 @@ def test_extra_middleware_adds_only_what_deepagents_lacks(model, backend):
         TodoCompletionMiddleware,
         SummarizationToolMiddleware,
         OpenAIPromptCachingMiddleware,
+        MemoryGuardMiddleware,
     ]
 
 
@@ -113,9 +116,12 @@ def test_every_subagent_plans_and_can_compact(subagents, name):
         TodoCompletionMiddleware,
         SummarizationToolMiddleware,
         OpenAIPromptCachingMiddleware,
+        MemoryGuardMiddleware,
     }
     if SUBAGENT_MEMORY[name]:
         expected.add(MemoryMiddleware)
+    if name == "job-search":  # the browser's file writes stay in its captures folder
+        expected.add(BrowserFileGuardMiddleware)
     assert kinds == expected
     cache = next(
         m for m in subagents[name]["middleware"] if isinstance(m, OpenAIPromptCachingMiddleware)
@@ -286,3 +292,29 @@ def test_main_agent_skills_are_the_orchestrator_folder():
 def test_empty_resume_stops_instead_of_inventing(prompt):
     text = getattr(prompts, prompt)
     assert "STOP" in text and "Never build a skeleton" in text
+
+
+def test_every_agent_must_plan_before_working(model, backend, subagents):
+    from genai_agentic_sandbox.agent import PLAN_BEFORE
+
+    for name, spec in subagents.items():
+        [mw] = [m for m in spec["middleware"] if isinstance(m, TodoCompletionMiddleware)]
+        assert mw.plan_before == PLAN_BEFORE[name]
+        assert {"execute", "write_file", "edit_file"} <= set(mw.plan_before), name
+    assert "browser_navigate" in PLAN_BEFORE["job-search"]
+    [orchestrator] = [
+        m for m in extra_middleware(model, backend) if isinstance(m, TodoCompletionMiddleware)
+    ]
+    assert orchestrator.plan_before == ("task",)
+    assert "PlanGateMiddleware" not in str(
+        create_jobhunter_agent(
+            model=model, backend=backend, browser_tools=[], resume_path="/input/cv.docx"
+        ).nodes
+    )
+
+
+def test_the_todo_list_is_the_single_source_of_truth():
+    prompt = prompts.jobhunter_prompt("/input/cv.docx")
+    assert "single source of truth, no plan files" in prompt
+    assert "user's new input change the plan, revise it" in prompt.replace("\n", " ")
+    assert "plan.md" not in prompt and not hasattr(prompts, "PLAN_FILE")

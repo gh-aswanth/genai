@@ -33,7 +33,12 @@ from pathlib import Path
 
 from genai_agentic_sandbox.agent import SKILLS_MOUNT, create_jobhunter_agent
 from genai_agentic_sandbox.caching import cache_stats
-from genai_agentic_sandbox.memory import DEFAULT_MEMORY_DIR, MEMORY_MOUNT, seed_memory
+from genai_agentic_sandbox.memory import (
+    MEMORY_DIRNAME,
+    MEMORY_MOUNT,
+    describe_memory,
+    seed_memory,
+)
 from genai_agentic_sandbox.prompts import DEFAULT_MAX_ROUNDS, DEFAULT_TARGET_SCORE
 from genai_agentic_sandbox.sandbox.docker import Mount
 
@@ -146,8 +151,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--memory-dir",
         type=Path,
-        default=DEFAULT_MEMORY_DIR,
-        help="long-term memory folder kept between runs (default ~/.jobhunter/memory)",
+        default=None,
+        help="long-term memory folder kept between runs (default: <out>/memories)",
     )
     parser.add_argument("--no-memory", action="store_true", help="run without long-term memory")
     parser.add_argument(
@@ -159,6 +164,19 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--headed", action="store_true", help="show the browser window")
     parser.add_argument("--no-verify", action="store_true", help="skip sandbox image check")
     return parser.parse_args(argv)
+
+
+_TODO_MARK = {"completed": "[x]", "in_progress": "[~]", "pending": "[ ]"}
+
+
+def format_todos(who: str, todos: list[dict]) -> str:
+    """The plan (todo list) as the terminal shows it whenever an agent updates it."""
+    done = sum(t.get("status") == "completed" for t in todos)
+    lines = [f"  [{who}] plan - {done}/{len(todos)} done"]
+    lines += [
+        f"      {_TODO_MARK.get(t.get('status'), '[ ]')} {t.get('content', '')}" for t in todos
+    ]
+    return "\n".join(lines)
 
 
 def _print_stream_chunk(namespace: tuple, update: dict) -> None:
@@ -175,6 +193,9 @@ def _print_stream_chunk(namespace: tuple, update: dict) -> None:
                 continue
             for call in getattr(message, "tool_calls", None) or []:
                 args = call["args"]
+                if call["name"] == "write_todos":  # the plan: show it in full
+                    print(format_todos(who, args.get("todos") or []))
+                    continue
                 if call["name"] == "task":
                     args = {
                         "subagent": args.get("subagent_type"),
@@ -266,7 +287,7 @@ async def run(args: argparse.Namespace) -> int:
         )
         return 2
 
-    memory_dir = None if args.no_memory else seed_memory(args.memory_dir)
+    memory_dir = None if args.no_memory else seed_memory(args.memory_dir or out / MEMORY_DIRNAME)
     model = init_chat_model(f"openai:{args.model}", temperature=0)
     try:
         backend = SandboxImageBuilder().backend(
@@ -284,7 +305,7 @@ async def run(args: argparse.Namespace) -> int:
         ) as browser_tools:
             print(f"Sandbox {backend.id} ({backend.image}); {len(browser_tools)} browser tools.")
             print(f"Resume copied to {resume_copy} (read-only) -> {resume_in_sandbox}")
-            print(f"Memory: {memory_dir or 'off'}")
+            print(describe_memory(memory_dir) if memory_dir else "Memory: off")
             print(
                 f"Tailored resumes for the top {args.top_jobs} jobs -> {out / 'resume'} "
                 f"(ATS target {args.target_score}, up to {args.max_rounds} rounds each)"
@@ -303,6 +324,8 @@ async def run(args: argparse.Namespace) -> int:
                 checkpointer=MemorySaver(),
             )
             await _chat(agent, args.task)
+    if memory_dir:
+        print(describe_memory(memory_dir))
     return 0
 
 

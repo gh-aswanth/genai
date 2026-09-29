@@ -5,8 +5,10 @@ description: How the orchestrator uses and maintains long-term memory in /memori
 
 # Long-term memory
 
-Two files in `/memories/` survive between runs (they live on the user's machine,
-outside the output folder, and cleanup never touches them). They are loaded
+Two files in `/memories/` survive between runs. On the user's disk they are the
+visible folder `<output folder>/memories/`. They are never deleted: cleanup
+protects them, and you only edit them - never delete, empty or rewrite them
+wholesale (use `edit_file` on the relevant lines). They are loaded
 into your prompt; subagents that need them load them read-only.
 
 | File | Keep in it | Never |

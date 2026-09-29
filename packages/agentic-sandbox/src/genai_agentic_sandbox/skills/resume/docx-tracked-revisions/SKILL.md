@@ -93,9 +93,36 @@ restores the original exactly. The first comment in both is the colour legend
    - review, all changes rejected == original text, same paragraph count;
    - review, all changes accepted == final copy's text;
    - final copy has no revision markup, comments or review colours;
+   - every new text run uses the resume's own font and size (`check_fonts`);
    - every change printed OK (fix every FAIL and re-run).
 5. Update `change_log.md` (round k section: changes, feedback items addressed,
    questions for the user).
+
+## Fonts: new text must look like the resume
+
+Resumes often set the font on every run (direct formatting, theme fonts like
+"minorHAnsi") while the paragraph style says something else (e.g. "Normal (Web)"
+= Times New Roman). A run created WITHOUT copying a neighbour's formatting falls
+back to the style font and looks visibly different. So:
+
+- Create text ONLY with the helpers (`track_insert`, `track_replace`,
+  `insert_paragraph_after`, `new_run(text, template_run(...))`). Never python-docx
+  `paragraph.add_run`, `doc.add_paragraph`, `insert_paragraph_before` or
+  `paragraph.text = ...` on the resume - they create unformatted runs.
+- `template_run(p, near)` picks the run to copy: the nearest real text run in the
+  paragraph (never a comment reference; a hyperlink only when inserting inside
+  the link), else a paragraph of the same style, else the resume's most common
+  body formatting. It copies the ORIGINAL formatting (before review colours).
+- New paragraphs: pass `like=` a paragraph of the SAME ROLE (a new bullet like an
+  existing bullet, a new heading like an existing heading, body like body) -
+  formatting, spacing, numbering and font all come from it. Do not invent styles:
+  a style the resume never uses (e.g. "ListBullet" when its bullets are
+  "ListParagraph") brings the template's default font - the helpers refuse it.
+- A replacement takes the font of the run holding most of the replaced text.
+- Intentional formatting changes are tracked (`track_format`,
+  `track_paragraph_style`) and shaded yellow - never silent.
+- `check_fonts(SRC, FINAL_OUT)` must return no problems: every new run uses a
+  font and size the original uses for that paragraph style.
 
 ## The markup
 
@@ -129,6 +156,7 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import RGBColor
 from docx.text.run import Run
+from lxml import etree
 
 AUTHOR, INITIALS = "JobHunter AI", "JH"
 DATE = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -257,12 +285,75 @@ def wrap(runs, tag):
     return out
 
 
+def has_text(r):
+    return any(c.tag == W_T and c.text for c in r)
+
+
+def is_link(r):
+    style = r.find(f"{W_RPR}/{qn('w:rStyle')}")
+    return r.getparent().tag == qn("w:hyperlink") or (
+        style is not None and "hyperlink" in (style.get(qn("w:val")) or "").lower()
+    )
+
+
+def original_rpr(like):
+    """The run's ORIGINAL formatting: before review colours / tracked format changes."""
+    rpr = like.find(W_RPR) if like is not None else None
+    if rpr is None:
+        return None
+    change = rpr.find(qn("w:rPrChange"))
+    if change is not None and change.find(W_RPR) is not None:
+        rpr = change.find(W_RPR)  # what the text looked like before this run's changes
+    rpr = copy.deepcopy(rpr)
+    for x in rpr.xpath("./w:rPrChange | ./w:ins | ./w:del | ./w:moveFrom | ./w:moveTo"):
+        rpr.remove(x)
+    return rpr
+
+
+def template_run(p, near=None, keep_link=False):
+    """The run whose font new text in paragraph p must copy - never None if the document
+    has any text. Order: `near` itself; the closest real text run in p (not a comment
+    reference, not a hyperlink unless keep_link); a text run of another paragraph with
+    the same style; the most common body-text formatting of the document."""
+
+    def usable(r):
+        return has_text(r) and (keep_link or not is_link(r))
+
+    runs = p.xpath("./w:r | ./w:hyperlink/w:r | ./w:ins/w:r | ./w:moveTo/w:r | ./w:del/w:r")
+    runs = [r for r in runs if usable(r) or (r.find(qn("w:delText")) is not None and not is_link(r))]
+    if near is not None and near in runs:
+        return near
+    if near is not None and runs:
+        order = list(p.iter(qn("w:r")))
+        pos = order.index(near) if near in order else len(order)
+        before = [r for r in runs if order.index(r) <= pos]
+        return before[-1] if before else runs[0]
+    if runs:
+        return runs[0]
+    body = p.getroottree().getroot()
+    style = p.xpath("string(./w:pPr/w:pStyle/@w:val)")
+    same = [r for q in body.iter(qn("w:p")) if q is not p
+            and q.xpath("string(./w:pPr/w:pStyle/@w:val)") == style
+            for r in q.xpath("./w:r | ./w:hyperlink/w:r") if usable(r)]
+    if same:
+        return same[0]
+    every = [r for r in body.iter(qn("w:r")) if usable(r)]
+    if not every:
+        return None
+    key = lambda r: etree.tostring(original_rpr(r)) if r.find(W_RPR) is not None else b""
+    counts = {}
+    for r in every:
+        counts[key(r)] = counts.get(key(r), 0) + 1
+    return max(every, key=lambda r: counts[key(r)])
+
+
 def new_run(text, like=None):
+    """A run with `like`'s ORIGINAL formatting (font, size, colour...). Always pass a
+    template - get one with template_run(); text without one falls back to the style's
+    default font and looks different from the rest of the resume."""
     r = OxmlElement("w:r")
-    if like is not None and like.find(W_RPR) is not None:
-        rpr = copy.deepcopy(like.find(W_RPR))
-        for old in rpr.findall(qn("w:rPrChange")):
-            rpr.remove(old)
+    rpr = original_rpr(like)
+    if rpr is not None:
         r.append(rpr)
     t = OxmlElement("w:t")
     t.text = text
@@ -312,11 +403,16 @@ def mark_paragraph(p, tag):
 
 
 def copy_ppr(src, dst):
+    """Copy paragraph formatting (style, spacing, numbering, mark font) without revisions."""
     ppr = src.find(W_PPR)
     if ppr is not None:
         ppr = copy.deepcopy(ppr)
-        for x in ppr.xpath("./w:sectPr | ./w:pPrChange | ./w:rPr"):
+        for x in ppr.xpath("./w:sectPr | ./w:pPrChange"):
             ppr.remove(x)
+        mark = ppr.find(W_RPR)
+        if mark is not None:
+            for x in mark.xpath("./w:ins | ./w:del | ./w:moveFrom | ./w:moveTo | ./w:rPrChange"):
+                mark.remove(x)
         dst.insert(0, ppr)
 
 
@@ -338,8 +434,9 @@ def track_delete(p, find, occurrence=1):
 
 def track_replace(p, find, new, occurrence=1):
     """Old text red + struck, new wording blue. Returns (first del, ins) for comments."""
-    like = isolate(p, find, occurrence)[0]
-    template = copy.deepcopy(like)
+    old = isolate(p, find, occurrence)
+    # the run holding most of the replaced text sets the font of the new wording
+    template = copy.deepcopy(max(old, key=lambda r: len(run_text(r))))
     dels = track_delete(p, find, occurrence)
     ins = rev("w:ins")
     r = new_run(new, template)
@@ -351,19 +448,19 @@ def track_replace(p, find, new, occurrence=1):
 
 def track_insert(p, text, after=None, occurrence=1):
     """Insert (green) after the exact text `after`; after="" = paragraph start, None = end."""
-    ins, runs = rev("w:ins"), visible_runs(p)
+    ins, runs = rev("w:ins"), [r for r in visible_runs(p) if has_text(r)]
     if after is None:
-        r = new_run(text, runs[-1] if runs else None)
+        r = new_run(text, template_run(p, runs[-1] if runs else None))
         ins.append(r)
         p.append(ins)
     elif after == "":
-        r = new_run(text, runs[0] if runs else None)
+        r = new_run(text, template_run(p, runs[0] if runs else None))
         ins.append(r)
         ppr = p.find(W_PPR)
         ppr.addnext(ins) if ppr is not None else p.insert(0, ins)
     else:
         anchor = isolate(p, after, occurrence)[-1]
-        r = new_run(text, anchor)
+        r = new_run(text, template_run(p, anchor))
         ins.append(r)
         top(anchor, p).addnext(ins)
     colorize([r], "added", existing=False)
@@ -390,8 +487,27 @@ def track_format(p, find, bold=None, italic=None, underline=None, occurrence=1):
     return runs
 
 
+def styles_in_use(p):
+    """Paragraph style ids the resume body actually uses."""
+    body = p.getroottree().getroot()
+    return {q.xpath("string(./w:pPr/w:pStyle/@w:val)") or "Normal" for q in body.iter(qn("w:p"))}
+
+
+def require_used_style(p, style_id):
+    """A style the resume never uses brings its own font (e.g. "ListBullet" = the
+    template's default font): refuse it - copy an existing paragraph of that role."""
+    if style_id not in styles_in_use(p):
+        raise ValueError(
+            f"style {style_id!r} is not used in this resume (it would change the font); "
+            f"use one of {sorted(styles_in_use(p))} or insert_paragraph_after(..., like=<a "
+            "paragraph of the same role>)"
+        )
+
+
 def track_paragraph_style(p, style_id):
-    """Tracked paragraph-style change (e.g. to "Heading2", "ListBullet"), shaded yellow."""
+    """Tracked paragraph-style change to a style the resume already uses (e.g. its own
+    heading style for a section title), shaded yellow."""
+    require_used_style(p, style_id)
     ppr = p.get_or_add_pPr()
     old = copy.deepcopy(ppr)
     for x in old.xpath("./w:rPr | ./w:sectPr | ./w:pPrChange"):
@@ -410,13 +526,14 @@ def insert_paragraph_after(anchor, text, style_id=None, like=None):
     """New paragraph (green) after `anchor`. Formatting is copied from `like` (default:
     the anchor) - pass a body paragraph when the anchor is a heading or the name line."""
     like = anchor if like is None else like
+    if style_id:
+        require_used_style(anchor, style_id)
     p = OxmlElement("w:p")
     copy_ppr(like, p)
     if style_id:
         p.get_or_add_pPr().style = style_id
-    runs = visible_runs(like)
     ins = rev("w:ins")
-    r = new_run(text, runs[0] if runs else None)
+    r = new_run(text, template_run(like))
     ins.append(r)
     p.append(ins)
     mark_paragraph(p, "w:ins")
@@ -576,6 +693,99 @@ def to_redline(doc):
         el.getparent().remove(el)
 
 
+def _theme_fonts(path):
+    """Theme font names ("minorHAnsi" -> "Calibri") from word/theme/theme1.xml."""
+    import zipfile
+    try:
+        xml = etree.fromstring(zipfile.ZipFile(path).read("word/theme/theme1.xml"))
+    except KeyError:
+        return {}
+    a = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+    out = {}
+    for kind in ("major", "minor"):
+        latin = xml.find(f".//{a}{kind}Font/{a}latin")
+        if latin is not None:
+            for suffix in ("HAnsi", "Ascii", "Bidi", "EastAsia"):
+                out[kind + suffix] = latin.get("typeface")
+    return out
+
+
+def effective_font(doc, p, r, theme=None):
+    """(font name, size in half-points) the run is shown with: direct formatting, then
+    its character style, the paragraph style chain, then document defaults."""
+    styles = doc.styles.element
+    def chain(style_id):
+        while style_id:
+            st = styles.xpath(f"./w:style[@w:styleId='{style_id}']")
+            if not st:
+                return
+            yield st[0].find(W_RPR)
+            based = st[0].find(qn("w:basedOn"))
+            style_id = based.get(qn("w:val")) if based is not None else None
+    rpr = r.find(W_RPR)
+    layers = [rpr]
+    rstyle = rpr.find(qn("w:rStyle")) if rpr is not None else None
+    if rstyle is not None:
+        layers += list(chain(rstyle.get(qn("w:val"))))
+    pstyle = p.xpath("string(./w:pPr/w:pStyle/@w:val)") or styles.xpath(
+        "string(./w:style[@w:type='paragraph'][@w:default='1']/@w:styleId)")
+    layers += list(chain(pstyle))
+    layers.append(styles.find(f"{qn('w:docDefaults')}/{qn('w:rPrDefault')}/{W_RPR}"))
+    font = size = None
+    for layer in layers:
+        if layer is None:
+            continue
+        fonts = layer.find(qn("w:rFonts"))
+        if font is None and fonts is not None:
+            font = fonts.get(qn("w:ascii")) or fonts.get(qn("w:asciiTheme"))
+        sz = layer.find(qn("w:sz"))
+        if size is None and sz is not None:
+            size = sz.get(qn("w:val"))
+    font = (theme or {}).get(font, font)
+    return font or "default", size or "default"
+
+
+def check_fonts(src, out, share=0.2):
+    """Every NEW or changed text run of `out` must use a font and a size that carry at
+    least `share` of the ORIGINAL's text in the same paragraph style (for a style the
+    original never used: of all its text). Weighting by text keeps a stray link or
+    symbol run from making an odd font "normal"; text the original already has, in the
+    same style and font, is untouched and not judged. Returns [(style, text, (font,
+    size))]; empty = OK."""
+    def runs(path):
+        doc, theme = Document(path), _theme_fonts(path)
+        default = doc.styles.element.xpath(
+            "string(./w:style[@w:type='paragraph'][@w:default='1']/@w:styleId)")
+        for p in doc.element.body.iter(qn("w:p")):
+            style = p.xpath("string(./w:pPr/w:pStyle/@w:val)") or default
+            for r in p.iter(qn("w:r")):
+                text = "".join(t.text or "" for t in r.iter(W_T, qn("w:delText")))
+                if text.strip():
+                    yield style, text, effective_font(doc, p, r, theme)
+
+    def usual(weights):  # {value: chars} -> values carrying at least `share` of the text
+        total = sum(weights.values())
+        return {v for v, n in weights.items() if n >= share * total}
+
+    by_style, overall, original = {}, {"font": {}, "size": {}}, {}
+    for style, text, (font, size) in runs(src):
+        original.setdefault((style, font, size), []).append(text)
+        stats = by_style.setdefault(style, {"font": {}, "size": {}})
+        for key, value in (("font", font), ("size", size)):
+            stats[key][value] = stats[key].get(value, 0) + len(text)
+            overall[key][value] = overall[key].get(value, 0) + len(text)
+    bad = []
+    for style, text, (font, size) in runs(out):
+        if any(text in t for t in original.get((style, font, size), [])):
+            continue  # original text, unchanged
+        stats = by_style.get(style, overall)
+        font_ok = font in usual(stats["font"])
+        size_ok = size in usual(stats["size"]) or size in usual(overall["size"])
+        if not (font_ok and size_ok):
+            bad.append((style, text[:60], (font, size)))
+    return bad
+
+
 def render(path, view="accepted"):
     """Paragraph texts with all changes accepted, or all rejected ("original")."""
     hide = {qn("w:del"), qn("w:moveFrom")} if view == "accepted" else {qn("w:ins"), qn("w:moveTo")}
@@ -686,6 +896,10 @@ original, accepted, final = render(SRC, "original"), render(REVIEW_OUT, "accepte
 print("CHECK reject-all == original:", render(REVIEW_OUT, "original") == original)
 print("CHECK accept-all == final:", accepted == final)
 print("CHECK final is clean:", not Document(FINAL_OUT).element.body.xpath(".//w:ins | .//w:del | .//w:moveTo | .//w:commentReference"))
+font_problems = check_fonts(SRC, FINAL_OUT)
+print("CHECK fonts match the original:", not font_problems)
+for style, text, font in font_problems[:10]:
+    print(f"  FONT {style}: {text!r} uses {font}")
 print("CHECK redline has no tracking:", not Document(REDLINE_OUT).element.body.xpath(".//w:ins | .//w:del | .//w:moveFrom | .//w:moveTo"))
 print("FINAL:", *final, sep="\n  ")
 ```

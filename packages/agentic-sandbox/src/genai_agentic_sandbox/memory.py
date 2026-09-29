@@ -1,7 +1,10 @@
 """Long-term agent memory: two Markdown files that survive between runs.
 
-The memory folder lives on the host (default `~/.jobhunter/memory`), outside
-every output folder, and is mounted read-write at `/memories` in the sandbox.
+The memory folder is a normal, visible folder on disk - by default
+`<output folder>/memories/` - mounted read-write at `/memories` in the sandbox.
+It is never deleted: `output-cleanup` protects it like `original/`, and runs
+only ever add to or edit the files. Memory written by earlier versions to the
+hidden `~/.jobhunter/memory` is copied in (not moved) the first time.
 Deep Agents' `MemoryMiddleware` loads the files into the system prompt of each
 agent that needs them (at the END of the prompt, so the cached prefix before it
 stays stable).
@@ -19,15 +22,24 @@ the questions from the last run's comments before the next run.
 
 from __future__ import annotations
 
+import re
+import shutil
+from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import Any
 
 from deepagents.backends.protocol import BackendProtocol
 from deepagents.middleware.memory import MemoryMiddleware
+from langchain.agents.middleware import AgentMiddleware
+from langchain_core.messages import ToolMessage
 
 MEMORY_MOUNT = "/memories"
 USER_PROFILE = f"{MEMORY_MOUNT}/user_profile.md"
 AGENT_NOTES = f"{MEMORY_MOUNT}/agent_notes.md"
-DEFAULT_MEMORY_DIR = Path("~/.jobhunter/memory")
+MEMORY_DIRNAME = "memories"  # default: <output folder>/memories
+# The same folder is visible in the sandbox at both paths.
+MEMORY_PATHS = (MEMORY_MOUNT, f"/output/{MEMORY_DIRNAME}")
+LEGACY_MEMORY_DIR = Path("~/.jobhunter/memory")
 
 TEMPLATES = {
     "user_profile.md": """\
@@ -81,15 +93,113 @@ orchestrator decides what to keep. Never include credentials.
 </memory_guidelines>"""
 
 
-def seed_memory(directory: Path) -> Path:
-    """Create the memory folder and missing template files; never overwrite."""
+def seed_memory(directory: Path, legacy: Path | None = LEGACY_MEMORY_DIR) -> Path:
+    """Create the memory folder with its files; never overwrite or delete anything.
+
+    Missing files are copied from `legacy` (memory of earlier versions) when it
+    has them, otherwise created from the templates.
+    """
     directory = directory.expanduser().resolve()
     directory.mkdir(parents=True, exist_ok=True)
+    legacy = legacy.expanduser() if legacy is not None else None
     for name, text in TEMPLATES.items():
         path = directory / name
-        if not path.exists():
+        if path.exists():
+            continue
+        old = legacy / name if legacy is not None else None
+        if old is not None and old.is_file() and old.resolve() != path:
+            shutil.copy2(old, path)
+        else:
             path.write_text(text)
     return directory
+
+
+def describe_memory(directory: Path) -> str:
+    """One line per memory file: path and size, for the run log."""
+    lines = [f"Memory folder: {directory}"]
+    for name in TEMPLATES:
+        path = directory / name
+        size = path.stat().st_size if path.exists() else 0
+        lines.append(f"  {path} ({size} bytes)")
+    return "\n".join(lines)
+
+
+# Shell commands that write, copy or append (read-only agents may not run these on memory).
+_WRITES = re.compile(
+    r"(>|\btee\b|\bcp\b|\bsed\s+-i|\btouch\b|write_text|write_bytes|open\([^)]*['\"][wa+])"
+)
+_FILE_TOOLS = {"write_file", "edit_file", "delete"}
+# Shell commands that would remove, move or empty something.
+_DESTRUCTIVE = re.compile(
+    r"(\brm\b|\brmdir\b|\bmv\b|\bunlink\b|\btruncate\b|rmtree|os\.remove|\.unlink\(|"
+    r"find\b.*-delete|(^|[^>])>\s*/)"
+)
+
+
+# "/output" itself or everything in it ("/output", "/output/", "/output/*"),
+# which contains the memory folder.
+_WHOLE_OUTPUT = re.compile(r"/output/?(\*|\.\*)?(?=$|[\s'\";)&|])")
+
+
+def _mentions_memory(text: str) -> bool:
+    return any(p in text for p in MEMORY_PATHS) or bool(_WHOLE_OUTPUT.search(text))
+
+
+class MemoryGuardMiddleware(AgentMiddleware):
+    """Protect the memory folder (/memories, also /output/memories).
+
+    For every agent: `delete` on a memory path, and `execute` commands that mention
+    a memory path together with a removing, moving or truncating operation, get an
+    error back instead of running. With `read_only=True` (subagents) any write to
+    memory - `write_file`, `edit_file`, `delete`, or a writing shell command - is
+    refused too: subagents report "Memory notes" and the orchestrator edits.
+
+    (Deep Agents' `permissions` rules would be the natural tool, but they are not
+    supported together with a sandbox backend that can `execute`.)
+    """
+
+    def __init__(self, read_only: bool = False) -> None:
+        super().__init__()
+        self.read_only = read_only
+
+    def _blocked(self, call: dict[str, Any]) -> str | None:
+        name, args = call.get("name"), call.get("args") or {}
+        path = str(args.get("file_path", ""))
+        if name in _FILE_TOOLS and _mentions_memory(path):
+            if self.read_only:
+                return (
+                    "memory is read-only for you: put what should be remembered under "
+                    "'Memory notes' in your final answer"
+                )
+            if name == "delete":
+                return "the memory folder is permanent: edit its files with edit_file, never delete them"
+        if name == "execute":
+            command = str(args.get("command", ""))
+            if _mentions_memory(command):
+                if _DESTRUCTIVE.search(command):
+                    return (
+                        "this command would remove, move or overwrite the memory folder, which "
+                        "is permanent. Edit the files with edit_file instead."
+                    )
+                if self.read_only and _WRITES.search(command):
+                    return "memory is read-only for you: report 'Memory notes' instead"
+        return None
+
+    def wrap_tool_call(self, request: Any, handler: Callable[[Any], Any]) -> Any:
+        reason = self._blocked(request.tool_call)
+        if reason:
+            return ToolMessage(
+                content=f"Error: {reason}", tool_call_id=request.tool_call["id"], status="error"
+            )
+        return handler(request)
+
+    async def awrap_tool_call(self, request: Any, handler: Callable[[Any], Awaitable[Any]]) -> Any:
+        reason = self._blocked(request.tool_call)
+        if reason:
+            return ToolMessage(
+                content=f"Error: {reason}", tool_call_id=request.tool_call["id"], status="error"
+            )
+        return await handler(request)
 
 
 def subagent_memory(backend: BackendProtocol, sources: list[str]) -> MemoryMiddleware:
@@ -99,11 +209,15 @@ def subagent_memory(backend: BackendProtocol, sources: list[str]) -> MemoryMiddl
 
 __all__ = [
     "AGENT_NOTES",
-    "DEFAULT_MEMORY_DIR",
+    "LEGACY_MEMORY_DIR",
+    "MEMORY_DIRNAME",
     "MEMORY_MOUNT",
+    "MEMORY_PATHS",
     "SUBAGENT_MEMORY_PROMPT",
     "TEMPLATES",
     "USER_PROFILE",
+    "MemoryGuardMiddleware",
+    "describe_memory",
     "seed_memory",
     "subagent_memory",
 ]

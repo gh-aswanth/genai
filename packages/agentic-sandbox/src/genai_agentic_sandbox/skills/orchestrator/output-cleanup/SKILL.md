@@ -19,7 +19,8 @@ asked to keep them, or the workflow was "only find jobs".
 | `/output/resume/<rank>-<slug>/<stem>_<slug>_{redline,review,final}.docx` | the tailored resumes (top of each job folder only) |
 | `/output/ats/ats_report.docx` | the ATS-only report |
 | `/output/original/` | the user's resume copy (read-only) |
-| `/output/.browser/` | the browser session in use (not agent output) |
+| `/output/memories/` | long-term memory (also mounted at `/memories`) - never deleted |
+| `/output/.browser/profile/` | the browser's profile (cookies, in use) - captures next to it ARE deleted |
 
 Everything else under `/output` is deleted - including the `v<k>/` round
 folders, `ats/` feedback, scripts, `jobs.json`, `match_report.*`, notes,
@@ -39,9 +40,11 @@ import os, re, shutil, sys
 from pathlib import Path
 
 ROOT = Path("/output")
-PROTECTED = {"original", ".browser"}  # top-level folders never touched
+# folders never touched (relative to /output)
+PROTECTED = {"original", "memories", ".browser/profile"}
 DELIVERABLE = [
-    re.compile(r"^resume/[^/]+/[^/]+_(redline|review|final)\.docx$"),
+    # (?!~\$): Word's lock files ("~$name.docx", while a file is open) are not deliverables
+    re.compile(r"^resume/[^/]+/(?!~\$)[^/]+_(redline|review|final)\.docx$"),
     re.compile(r"^ats/ats_report\.docx$"),
 ]
 
@@ -50,11 +53,7 @@ def plan(root=ROOT):
     keep, delete = [], []
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
         rel_dir = Path(dirpath).relative_to(root)
-        if rel_dir.parts and rel_dir.parts[0] in PROTECTED:
-            dirnames[:] = []
-            continue
-        if not rel_dir.parts:
-            dirnames[:] = [d for d in dirnames if d not in PROTECTED]
+        dirnames[:] = [d for d in dirnames if (rel_dir / d).as_posix() not in PROTECTED]
         for name in filenames:
             rel = (rel_dir / name).as_posix()
             (keep if any(p.match(rel) for p in DELIVERABLE) else delete).append(rel)
@@ -69,7 +68,8 @@ def apply(delete, root=ROOT):
     for dirpath, _dirs, _files in sorted(os.walk(root), key=lambda x: -len(x[0])):
         d = Path(dirpath)
         rel = d.relative_to(root)
-        if d != root and rel.parts[0] not in PROTECTED and not any(d.iterdir()):
+        protected = any(rel.as_posix() == p or rel.as_posix().startswith(p + "/") for p in PROTECTED)
+        if d != root and not protected and not any(d.iterdir()):
             d.rmdir()
 
 
