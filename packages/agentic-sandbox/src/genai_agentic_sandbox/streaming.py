@@ -15,7 +15,9 @@ for its kind:
 | `custom` | `on_custom_event` | anything a tool/middleware dispatches |
 
 Which agent an event belongs to comes from `metadata["lc_agent_name"]`; its depth
-from how many `task` runs are among its parents. `RichRenderer` registers one
+from how many `task` runs it is inside - found from its parent run ids and, as
+those are cut to the immediate parent when LangSmith tracing is on, from its
+LangGraph checkpoint namespace. `RichRenderer` registers one
 listener per kind and renders them with a Rich console.
 """
 
@@ -24,15 +26,17 @@ from __future__ import annotations
 import json
 import re
 import time
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
-from rich.console import Console
+from rich.console import Console, ConsoleOptions, Group, RenderResult
 from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
+from rich.rule import Rule
 from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
@@ -82,6 +86,8 @@ class TaskRun:
     lane: str  # label of the outermost task it runs in (itself, for a top-level task)
     started: float
     top_level: bool  # started by the orchestrator (one parallel lane)
+    started_at: float = field(default_factory=time.time)  # wall clock, for display
+    ns: tuple[str, ...] = ()  # checkpoint namespace the call ran in, e.g. ("tools:<id>",)
 
 
 _LABEL = re.compile(r"^\s*\[([^\]\n]{1,48})\]")
@@ -103,6 +109,16 @@ def lane_label(description: str | None, subagent: str | None, n: int) -> str:
     if m := _JOB_WORD.search(text):
         return f"job {m.group(1)}"
     return f"{subagent or 'task'} #{n}"
+
+
+_SHORT_JOB = re.compile(r"^(job [\w-]+)\s*:")
+
+
+def short_lane(label: str) -> str:
+    """The lane's short badge: "job 1" for "job 1: acme-backend", else the label
+    cut to 14 characters."""
+    m = _SHORT_JOB.match(label)
+    return m.group(1) if m else label[:14]
 
 
 Listener = Callable[[AgentEvent], Awaitable[None] | None]
@@ -148,8 +164,43 @@ class EventStream:
 
     # -- classification ----------------------------------------------------------
 
+    @staticmethod
+    def _ns(raw: dict) -> tuple[str, ...]:
+        ns = (raw.get("metadata") or {}).get("langgraph_checkpoint_ns") or ""
+        return tuple(ns.split("|")) if ns else ()
+
+    def _tasks(self, raw: dict) -> list[TaskRun]:
+        """The running `task` calls this event is inside, outermost first.
+
+        From the event's parent run ids and from its checkpoint namespace: all a
+        `task` call runs is namespaced under the `tools:<id>` it ran in. The
+        namespace is needed because the parent ids are not always complete - with
+        LangSmith tracing on they hold only the immediate parent, which would leave
+        every event inside a subagent unattributed (0 model / 0 tool calls per lane).
+        """
+        found = {p: self._task_runs[p] for p in raw.get("parent_ids") or [] if p in self._task_runs}
+        if ns := self._ns(raw):
+            for run_id, run in self._task_runs.items():
+                if run.ns and ns[: len(run.ns)] == run.ns:
+                    found[run_id] = run
+        return sorted(found.values(), key=lambda run: run.started)  # outer ones start first
+
     def _depth(self, raw: dict) -> int:
-        return sum(1 for p in raw.get("parent_ids") or [] if p in self._task_runs)
+        return len(self._tasks(raw))
+
+    def _lane(self, raw: dict) -> tuple[str | None, tuple[str, ...]]:
+        """(lane, subagent path) from the `task` runs the event is inside (root first)."""
+        tasks = self._tasks(raw)
+        return (tasks[0].lane if tasks else None), tuple(t.subagent for t in tasks)
+
+    @property
+    def running(self) -> dict[str, TaskRun]:
+        """Tasks started and not finished yet, by run id."""
+        return dict(self._task_runs)
+
+    def lanes_running(self) -> int:
+        """How many of the orchestrator's tasks (parallel lanes) are running now."""
+        return sum(1 for t in self._task_runs.values() if t.top_level)
 
     def _lane(self, raw: dict) -> tuple[str | None, tuple[str, ...]]:
         """(lane, subagent path) from the `task` runs among the parents (root first)."""
@@ -211,11 +262,17 @@ class EventStream:
                     "subagent_start", subagent=subagent, task=args.get("description"), label=label
                 )
                 self._task_runs[run_id] = TaskRun(
-                    label, subagent, outer or label, time.monotonic(), top_level=outer is None
+                    label,
+                    subagent,
+                    outer or label,
+                    time.monotonic(),
+                    top_level=outer is None,
+                    ns=self._ns(raw),
                 )
                 if outer is None:
                     event.lane = label
                     event.data["running"] = self.lanes_running()
+                    event.data["started_at"] = self._task_runs[run_id].started_at
                 return event
             if name == "write_todos":
                 return make("todos", todos=list(args.get("todos") or []))
@@ -235,6 +292,7 @@ class EventStream:
                 if run is not None and run.top_level:
                     event.lane = run.label
                     event.data["still_running"] = self.lanes_running()
+                    event.data["started_at"], event.data["ended_at"] = run.started_at, time.time()
                 return event
             if name == "write_todos":
                 return None
@@ -302,6 +360,177 @@ _CODE_EXT = {
 }
 
 
+def _line(*parts: Any) -> Text:
+    """One window row: never wraps, so a window's height is exactly its row count."""
+    text = Text.assemble(*parts)
+    text.no_wrap, text.overflow = True, "ellipsis"
+    return text
+
+
+def _clock(ts: float | None) -> str:
+    """Wall-clock time of day, e.g. "14:02:11"; "-" when unknown."""
+    return datetime.fromtimestamp(ts).astimezone().strftime("%H:%M:%S") if ts else "-"
+
+
+def _first_line(text: Any, width: int = 200) -> str:
+    lines = str(text or "").strip().splitlines()
+    return lines[0][:width] if lines else ""
+
+
+@dataclass
+class LaneWindow:
+    """What one parallel lane's window shows."""
+
+    lane: str
+    subagent: str
+    started: float
+    lines: deque[Text] = field(default_factory=lambda: deque(maxlen=300))
+    plans: dict[str, list[dict]] = field(default_factory=dict)  # agent -> its latest todos
+    streaming: str = ""  # text of the model call streaming in this lane right now
+    status: str = "running"
+    seconds: float | None = None
+
+
+class LaneWindows:
+    """A live grid with one window per parallel lane.
+
+    Each window shows its lane's plans (one progress line per agent), a scrolling
+    log of what its agents do (subagent calls, tools, answers) and, at the bottom,
+    the model text streaming in that lane right now. The grid is redrawn in place
+    while lanes run; everything outside the lanes still prints above it. When the
+    last lane finishes, the final frame stays on screen.
+    """
+
+    MIN_WIDTH = 56  # narrowest window before the grid drops a column
+
+    def __init__(self, renderer: RichRenderer) -> None:
+        self.renderer = renderer
+        self.windows: dict[str, LaneWindow] = {}
+        self._live: Live | None = None
+
+    @property
+    def active(self) -> bool:
+        return self._live is not None
+
+    def get(self, event: AgentEvent) -> LaneWindow | None:
+        return self.windows.get(event.lane) if self._live and event.lane else None
+
+    def open(self, lane: str, subagent: str, brief: str) -> None:
+        if self._live is None:
+            self.windows = {}
+            self._live = Live(
+                self, console=self.renderer.console, refresh_per_second=8, transient=False
+            )
+            self._live.start()
+        window = self.windows[lane] = LaneWindow(lane, subagent, time.monotonic())
+        for row in brief.strip().splitlines()[:3]:
+            window.lines.append(_line((row, "italic dim")))
+
+    def finish(self, lane: str, *, failed: bool, seconds: float) -> None:
+        if window := self.windows.get(lane):
+            window.status, window.seconds, window.streaming = (
+                "failed" if failed else "done",
+                seconds,
+                "",
+            )
+
+    def close(self) -> None:
+        if self._live is not None:
+            self._live.stop()
+            if not self.renderer.console.is_terminal:
+                self.renderer.console.line()  # Live adds it itself only on a terminal
+        self._live = None
+
+    def log(self, event: AgentEvent, *parts: Any) -> None:
+        """Append a row to the event's lane window, badged with its job and tagged
+        with the agent (indented by its depth below the lane's own agent)."""
+        if window := self.get(event):
+            badge = (short_lane(window.lane), f"bold {self.renderer.lane_colour(window.lane)}")
+            indent = "  " * max(event.depth - 1, 0)
+            agent = (event.agent, f"bold {self.renderer.colour(event.agent)}")
+            window.lines.append(_line(badge, (" › ", "dim"), indent, agent, " ", *parts))
+
+    # -- drawing -------------------------------------------------------------------
+
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        windows = list(self.windows.values())
+        if not windows:
+            return
+        cols = max(1, min(len(windows), options.max_width // self.MIN_WIDTH))
+        rows = -(-len(windows) // cols)
+        # Equal windows, as tall as the fullest one needs, all fitting on screen.
+        needed = max(self._rows(w) for w in windows) + 2
+        height = max(6, min(needed, (console.height - 2) // rows))
+        grid = Table.grid(expand=True, padding=(0, 1))
+        for _ in range(cols):
+            grid.add_column(ratio=1)
+        panels = [self._panel(w, height) for w in windows]
+        for i in range(0, len(panels), cols):
+            row = panels[i : i + cols]
+            grid.add_row(*row, *[""] * (cols - len(row)))
+        yield grid
+
+    @staticmethod
+    def _rows(window: LaneWindow) -> int:
+        plans = len(window.plans) + 1 if window.plans else 0
+        return plans + len(window.lines) + bool(window.streaming)
+
+    def _panel(self, window: LaneWindow, height: int) -> Panel:
+        colour = self.renderer.lane_colour(window.lane)
+        body = height - 2  # rows inside the border
+        top: list[Any] = []
+        for agent, todos in list(window.plans.items()):
+            done = sum(t.get("status") == "completed" for t in todos)
+            current = next((t for t in todos if t.get("status") == "in_progress"), None)
+            top.append(
+                _line(
+                    ("plan ", "bold"),
+                    (f"{done}/{len(todos)} ", "green" if done == len(todos) else "yellow"),
+                    (agent, self.renderer.colour(agent)),
+                    (f"  ◐ {current.get('content', '')}" if current else "", "yellow"),
+                )
+            )
+        top = top[: max(body // 3, 1)]
+        if top:
+            top.append(Rule(style="dim"))
+        tail: list[Text] = []
+        if window.streaming:
+            tail.append(_line(("💬 ", ""), (window.streaming.splitlines()[-1], "italic")))
+        room = max(body - len(top) - len(tail), 0)
+        log = list(window.lines)[-room:] if room else []
+        rows = [*top, *log, *tail]
+        stats = self.renderer.lanes.get(window.lane, {})
+        seconds = (
+            window.seconds if window.seconds is not None else time.monotonic() - window.started
+        )
+        icon, style = {
+            "running": ("◐ running", "bold yellow"),
+            "done": ("✔ done", "bold green"),
+            "failed": ("✗ failed", "bold red"),
+        }[window.status]
+        return Panel(
+            Group(*rows),
+            title=Text.assemble(
+                (f" {window.lane} ", f"bold {colour}"),
+                (window.subagent, self.renderer.colour(window.subagent)),
+                " ",
+            ),
+            title_align="left",
+            subtitle=Text.assemble(
+                (f" {icon} {seconds:.1f}s", style),
+                (
+                    f" · {stats.get('model', 0)} model / {stats.get('tools', 0)} tools"
+                    + (f" / {stats['errors']} errors" if stats.get("errors") else "")
+                    + " ",
+                    "dim",
+                ),
+            ),
+            subtitle_align="right",
+            border_style="red" if window.status == "failed" else colour,
+            height=height,
+        )
+
+
 class RichRenderer:
     """Listeners that render every event kind with a Rich console.
 
@@ -309,10 +538,18 @@ class RichRenderer:
         console: Rich console (pass `Console(record=True)` to capture output).
         show_nodes: Also show graph nodes (model / tools / middleware steps).
         max_lines: Lines of code / output shown per tool call.
+        windows: Stream each parallel lane in its own window of a live grid
+            (`LaneWindows`) instead of interleaving the lanes' lines. Default: on
+            when the console is an interactive terminal.
     """
 
     def __init__(
-        self, console: Console | None = None, *, show_nodes: bool = False, max_lines: int = 12
+        self,
+        console: Console | None = None,
+        *,
+        show_nodes: bool = False,
+        max_lines: int = 12,
+        windows: bool | None = None,
     ) -> None:
         self.console = console or Console()
         self.show_nodes = show_nodes
@@ -329,6 +566,8 @@ class RichRenderer:
             str, dict[str, Any]
         ] = {}  # lane -> subagent, seconds, status, result, counts
         self._batch: list[str] = []  # lanes of the current parallel batch
+        self.use_windows = self.console.is_terminal if windows is None else windows
+        self.windows = LaneWindows(self)
 
     def attach(self, stream: EventStream) -> RichRenderer:
         for kind in KINDS:
@@ -389,6 +628,8 @@ class RichRenderer:
 
     def on_agent_start(self, event: AgentEvent) -> None:
         self._end_stream()
+        if self.windows.get(event):
+            return self.windows.log(event, ("▶ started", "bold"))
         if event.depth == 0:
             self.console.rule(Text(f" {event.agent} ", style=f"bold {self.colour(event.agent)}"))
         else:
@@ -396,6 +637,8 @@ class RichRenderer:
 
     def on_agent_end(self, event: AgentEvent) -> None:
         self._end_stream()
+        if self.windows.get(event):
+            return self.windows.log(event, ("■ finished", "bold"))
         if event.depth > 0:
             self.console.print(Text.assemble(self.tag(event), ("■ finished", "bold")))
 
@@ -404,22 +647,34 @@ class RichRenderer:
         sub = event.data.get("subagent") or "subagent"
         self.calls[f"task→{sub}"] += 1
         running = event.data.get("running")
+        brief = str(event.data.get("task") or "")
+        if running is None and self.windows.get(event):  # a nested task inside a lane
+            return self.windows.log(
+                event,
+                ("task → ", "bold"),
+                (sub, f"bold {self.colour(sub)}"),
+                f"  {_first_line(brief)}",
+            )
         if running is not None:  # a lane started by the orchestrator
             stats = self._lane_stats(event)
-            stats.update(subagent=sub, status="running")
+            stats.update(subagent=sub, status="running", started_at=event.data.get("started_at"))
             if event.lane not in self._batch:
                 self._batch.append(event.lane)
+            if self.use_windows and event.lane:
+                self.windows.open(event.lane, sub, brief)
             self.console.print(
                 Text.assemble(
                     ("▶ ", "bold"),
                     (event.lane, f"bold {self.lane_colour(event.lane)}"),
-                    (f"  {sub} started", "bold"),
+                    (f"  {sub} started at {_clock(event.data.get('started_at'))}", "bold"),
                     (f"  ·  {running} running in parallel" if running > 1 else "", "bold yellow"),
                 )
             )
+            if self.windows.active:  # the brief heads the lane's window
+                return
         self.console.print(
             Panel(
-                Text(str(event.data.get("task") or ""), overflow="fold"),
+                Text(brief, overflow="fold"),
                 title=Text.assemble(
                     self.tag(event, own_lane=running is None),
                     ("task → ", "bold"),
@@ -439,6 +694,18 @@ class RichRenderer:
         self._end_stream()
         sub = event.data.get("subagent") or "subagent"
         still = event.data.get("still_running")
+        failed = bool(event.data.get("error"))
+        if still is None and self.windows.get(event):  # a nested task inside a lane
+            return self.windows.log(
+                event,
+                ("← ", "bold"),
+                (sub, f"bold {self.colour(sub)}"),
+                (f"  {_first_line(event.data.get('output'))}", "red" if failed else "dim"),
+            )
+        if still is not None and self.windows.active and event.lane:
+            self.windows.finish(event.lane, failed=failed, seconds=event.data.get("seconds") or 0.0)
+            if still == 0:  # the last lane: leave the final frame on screen
+                self.windows.close()
         title = [(sub, f"bold {self.colour(sub)}"), (" → result", "bold")]
         if event.lane:
             title = [(event.lane, f"bold {self.lane_colour(event.lane)}"), (" › ", "dim"), *title]
@@ -452,12 +719,12 @@ class RichRenderer:
         )
         if still is None:  # a nested task (inside a lane), not a lane itself
             return
-        failed = bool(event.data.get("error"))
         seconds = event.data.get("seconds") or 0.0
         output = (event.data.get("output") or "").strip().splitlines()
         self._lane_stats(event).update(
             status="failed" if failed else "done",
             seconds=seconds,
+            ended_at=event.data.get("ended_at"),
             result=output[0][:80] if output else "",
         )
         mark, style = ("✗", "bold red") if failed else ("■", "bold")
@@ -466,8 +733,81 @@ class RichRenderer:
                 (f"{mark} ", style),
                 (event.lane, f"bold {self.lane_colour(event.lane)}"),
                 (f"  {sub} {'failed' if failed else 'finished'} in {seconds:.1f}s", style),
+                (f" at {_clock(event.data.get('ended_at'))}", style),
                 (f"  ·  {still} still running" if still else "", "bold yellow"),
             )
+        )
+        if still == 0 and len(self._batch) > 1:
+            self._batch_table()
+        if still == 0:
+            self._batch = []
+
+    def _batch_table(self) -> None:
+        stats = [self.lanes.get(lane, {}) for lane in self._batch]
+        starts = [st["started_at"] for st in stats if st.get("started_at")]
+        ends = [st["ended_at"] for st in stats if st.get("ended_at")]
+        first, last = (min(starts), max(ends)) if starts and ends else (None, None)
+        table = Table(
+            title=f"parallel batch: {len(self._batch)} tasks",
+            caption=f"timeline: {_clock(first)} → {_clock(last)}, overlapping bars ran at the same time",
+            header_style="bold",
+        )
+        for column in (
+            "lane",
+            "agent",
+            "status",
+            "started",
+            "ended",
+            "time",
+            "timeline",
+            "model calls",
+            "tool calls",
+            "errors",
+            "result",
+        ):
+            table.add_column(
+                column,
+                justify="right"
+                if column in ("time", "model calls", "tool calls", "errors")
+                else "left",
+                # One line per job: only the result gives way on a narrow terminal.
+                no_wrap=column != "result",
+                min_width=len("00:00:00") if column in ("started", "ended") else None,
+                overflow="ellipsis" if column == "result" else "fold",
+            )
+        for lane in self._batch:
+            st = self.lanes.get(lane, {})
+            status = st.get("status", "?")
+            table.add_row(
+                Text(lane, style=f"bold {self.lane_colour(lane)}"),
+                st.get("subagent", ""),
+                Text(status, style="red" if status == "failed" else "green"),
+                _clock(st.get("started_at")),
+                _clock(st.get("ended_at")),
+                f"{st.get('seconds', 0.0):.1f}s",
+                self._timeline(lane, st, first, last),
+                str(st.get("model", 0)),
+                str(st.get("tools", 0)),
+                str(st.get("errors", 0)),
+                st.get("result", ""),
+            )
+        self.console.print(table)
+
+    TIMELINE_WIDTH = 16
+
+    def _timeline(
+        self, lane: str, st: dict[str, Any], first: float | None, last: float | None
+    ) -> Text:
+        """The lane's run as a bar on the batch's time axis: overlapping bars are
+        jobs that ran at the same time."""
+        start, end, width = st.get("started_at"), st.get("ended_at"), self.TIMELINE_WIDTH
+        if not (start and end and first and last):
+            return Text("")
+        span = max(last - first, 1e-9)
+        a = min(int((start - first) / span * width), width - 1)
+        b = max(round((end - first) / span * width), a + 1)
+        return Text.assemble(
+            ("·" * a, "dim"), ("█" * (b - a), self.lane_colour(lane)), ("·" * (width - b), "dim")
         )
         if still == 0 and len(self._batch) > 1:
             self._batch_table()
@@ -512,6 +852,8 @@ class RichRenderer:
     def on_node_start(self, event: AgentEvent) -> None:
         if self.show_nodes:
             self._end_stream()
+            if self.windows.get(event):
+                return self.windows.log(event, (f"· {event.name}", "dim"))
             self.console.print(Text.assemble(self.tag(event), (f"· {event.name}", "dim")))
 
     def on_node_end(self, event: AgentEvent) -> None:
@@ -526,6 +868,8 @@ class RichRenderer:
         if self.show_nodes:
             self._end_stream()
             model = event.data.get("model") or "model"
+            if self.windows.get(event):
+                return self.windows.log(event, (f"🧠 {model}", "dim"))
             self.console.print(
                 Text.assemble(
                     self.tag(event),
@@ -534,8 +878,14 @@ class RichRenderer:
             )
 
     def on_model_token(self, event: AgentEvent) -> None:
-        """Stream the orchestrator's text live, rendered as Markdown as it arrives."""
+        """Stream the orchestrator's text live, rendered as Markdown as it arrives;
+        a lane's text streams into the bottom row of its window."""
+        if window := self.windows.get(event):
+            window.streaming += event.data.get("text", "")
+            return
         if event.depth > 0:  # subagents: their answer is shown when the task returns
+            return
+        if self.windows.active:  # one Live at a time: printed whole at model_end
             return
         if self._streaming != event.run_id:
             self._end_stream()
@@ -554,6 +904,11 @@ class RichRenderer:
         self.usage["output"] += usage.get("output_tokens", 0) or 0
         self.usage["cached"] += cached
         text, tool_calls = event.data.get("text") or "", event.data.get("tool_calls") or []
+        if window := self.windows.get(event):
+            window.streaming = ""
+            if text.strip():
+                self.windows.log(event, ("💬 ", ""), (_first_line(text), "italic"))
+            return
         if event.depth == 0 and text and not tool_calls and not streamed:
             self.console.print(self._answer_panel(event.agent, text))
         tasks = [c for c in tool_calls if c.get("name") == "task"]
@@ -622,12 +977,34 @@ class RichRenderer:
             stats["tools"] += 1
         self._tool_started[event.run_id] = time.monotonic()
         args = event.data.get("args") or {}
-        self.console.print(
-            Text.assemble(self.tag(event), ("🔧 ", ""), (self._headline(event.name, args), "bold"))
+        if self.windows.get(event):
+            command = _first_line(args.get("command")) if event.name == "execute" else ""
+            return self.windows.log(
+                event,
+                ("🔧 ", ""),
+                (self._headline(event.name, args), "bold"),
+                (f"  $ {command}" if command else "", "dim"),
+            )
+        headline = Text.assemble(
+            self.tag(event), ("🔧 ", ""), (self._headline(event.name, args), "bold")
         )
         view = self._args_view(event.name, args)
-        if view is not None:
-            self.console.print(Panel(view, border_style=self.colour(event.agent), padding=(0, 1)))
+        if view is None:
+            self.console.print(headline)
+            return
+        # The call's code / arguments box carries the "[lane › agent]" tag too, so a
+        # box from a parallel job is never anonymous among the others' output.
+        self.console.print(
+            Panel(
+                view,
+                title=headline,
+                title_align="left",
+                border_style=self.lane_colour(event.lane)
+                if event.lane
+                else self.colour(event.agent),
+                padding=(0, 1),
+            )
+        )
 
     def _elapsed(self, event: AgentEvent) -> str:
         started = self._tool_started.pop(event.run_id, None)
@@ -635,8 +1012,15 @@ class RichRenderer:
 
     def on_tool_end(self, event: AgentEvent) -> None:
         self._end_stream()
-        first = (event.data.get("output") or "").strip().splitlines()[:1]
-        preview = first[0][:160] if first else ""
+        preview = _first_line(event.data.get("output"), 160)
+        if self.windows.get(event):
+            return self.windows.log(
+                event,
+                ("✓ ", "green"),
+                (event.name, "green"),
+                (self._elapsed(event), "dim"),
+                (f"  {preview}" if preview else "", "dim"),
+            )
         self.console.print(
             Text.assemble(
                 self.tag(event),
@@ -652,6 +1036,12 @@ class RichRenderer:
         self.calls["errors"] += 1
         if (stats := self._lane_stats(event)) is not None:
             stats["errors"] += 1
+        if self.windows.get(event):
+            return self.windows.log(
+                event,
+                (f"✗ {event.name}{self._elapsed(event)}  ", "bold red"),
+                (_first_line(event.data.get("output")), "red"),
+            )
         self.console.print(
             Panel(
                 Text(self._clip(event.data.get("output") or ""), overflow="fold"),
@@ -668,6 +1058,9 @@ class RichRenderer:
     def on_todos(self, event: AgentEvent) -> None:
         self._end_stream()
         todos = event.data.get("todos") or []
+        if window := self.windows.get(event):
+            window.plans[event.agent] = todos
+            return
         done = sum(t.get("status") == "completed" for t in todos)
         table = Table(show_header=False, box=None, padding=(0, 1))
         for todo in todos:
@@ -684,6 +1077,10 @@ class RichRenderer:
 
     def on_custom(self, event: AgentEvent) -> None:
         self._end_stream()
+        if self.windows.get(event):
+            return self.windows.log(
+                event, (f"• {event.name}: {event.data.get('payload')}", "italic")
+            )
         self.console.print(
             Text.assemble(
                 self.tag(event), (f"• {event.name}: {event.data.get('payload')}", "italic")
@@ -694,6 +1091,7 @@ class RichRenderer:
 
     def summary(self) -> None:
         self._end_stream()
+        self.windows.close()  # the run stopped or failed with lanes still open
         table = Table(title="run summary", show_header=True, header_style="bold")
         table.add_column("what")
         table.add_column("count", justify="right")
@@ -709,7 +1107,8 @@ class RichRenderer:
         for lane, st in self.lanes.items():
             table.add_row(
                 Text(f"lane {lane}", style=f"bold {self.lane_colour(lane)}"),
-                f"{st.get('status', '?')} {st.get('seconds', 0.0):.1f}s · "
+                f"{st.get('status', '?')} {st.get('seconds', 0.0):.1f}s "
+                f"({_clock(st.get('started_at'))} → {_clock(st.get('ended_at'))}) · "
                 f"{st.get('model', 0)} model / {st.get('tools', 0)} tool calls",
             )
         self.console.print(table)
@@ -721,8 +1120,11 @@ __all__ = [
     "LANE_COLOURS",
     "AgentEvent",
     "EventStream",
+    "LaneWindow",
+    "LaneWindows",
     "Listener",
     "RichRenderer",
     "TaskRun",
     "lane_label",
+    "short_lane",
 ]

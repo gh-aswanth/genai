@@ -165,30 +165,43 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         action="store_true",
         help="also show graph nodes (model / tools / middleware steps) and per-call token usage",
     )
+    parser.add_argument(
+        "--no-windows",
+        action="store_true",
+        help="interleave parallel jobs' lines instead of one live window per job",
+    )
     parser.add_argument("--headed", action="store_true", help="show the browser window")
     parser.add_argument("--no-verify", action="store_true", help="skip sandbox image check")
     return parser.parse_args(argv)
 
 
 async def _run_turn(
-    agent, text: str, thread_id: str, *, verbose: bool = False, console=None
+    agent,
+    text: str,
+    thread_id: str,
+    *,
+    verbose: bool = False,
+    windows: bool | None = None,
+    console=None,
 ) -> None:
     """One request, streamed live: LangChain event stream v2 -> listeners -> Rich."""
     from genai_agentic_sandbox.streaming import EventStream, RichRenderer
 
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 1000}
     stream = EventStream()
-    renderer = RichRenderer(console, show_nodes=verbose).attach(stream)
+    renderer = RichRenderer(console, show_nodes=verbose, windows=windows).attach(stream)
     try:
         await stream.run(agent, {"messages": [{"role": "user", "content": text}]}, config)
     finally:
         renderer.summary()
 
 
-async def _chat(agent, first: str | None, *, verbose: bool = False) -> None:
+async def _chat(
+    agent, first: str | None, *, verbose: bool = False, windows: bool | None = None
+) -> None:
     thread = f"session-{uuid.uuid4().hex[:8]}"
     if first:
-        await _run_turn(agent, first, thread, verbose=verbose)
+        await _run_turn(agent, first, thread, verbose=verbose, windows=windows)
         return
     print(BANNER)
     while True:
@@ -207,7 +220,7 @@ async def _chat(agent, first: str | None, *, verbose: bool = False) -> None:
             print("New session. Files in the output folder are kept.\n")
             continue
         try:
-            await _run_turn(agent, text, thread, verbose=verbose)
+            await _run_turn(agent, text, thread, verbose=verbose, windows=windows)
         except KeyboardInterrupt:
             print("\n[stopped]\n")
         except Exception as exc:  # noqa: BLE001 - keep the session alive
@@ -272,7 +285,12 @@ async def run(args: argparse.Namespace) -> int:
                 cache_retention=args.prompt_cache_retention,
                 checkpointer=MemorySaver(),
             )
-            await _chat(agent, args.task, verbose=args.verbose)
+            await _chat(
+                agent,
+                args.task,
+                verbose=args.verbose,
+                windows=False if args.no_windows else None,
+            )
     if memory_dir:
         print(describe_memory(memory_dir))
     return 0
