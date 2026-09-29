@@ -26,13 +26,11 @@ who does what, from what, to what, and how you will know it is done:
 ```
 1. job-search: 25 senior Python jobs, Kochi (remote OK) -> /output/jobs/jobs.json | done: >= 1 job, fields normalised
 2. job-matcher: resume + jobs.json, pick best 2 -> /output/match/match_report.json | done: 2 selected_jobs with changes
-3. resume-builder: job 1 round 1 -> /output/resume/1-<slug>/v1/ | done: 3 .docx, all CHECK lines True
-4. ats-reviewer: job 1 round 1 -> .../ats/round-1.json | done: score + verdict
-5. resume-builder: job 2 round 1 -> /output/resume/2-<slug>/v1/ | done: 3 .docx, all CHECK lines True
-6. ats-reviewer: job 2 round 1 -> .../ats/round-1.json | done: score + verdict
-7. finalise jobs: copy best rounds up, ats_history.json | done: 3 deliverables per job
-8. memory: save durable notes | done: memory files updated
-9. output-cleanup: keep deliverables only | done: KEEP list checked
+3. [job 1: <slug>] job-optimizer (parallel with 4) -> /output/resume/1-<slug>/ | done: 3 deliverables + ats_history.json
+4. [job 2: <slug>] job-optimizer (parallel with 3) -> /output/resume/2-<slug>/ | done: 3 deliverables + ats_history.json
+5. verify all jobs' deliverables | done: every job has redline, review, final .docx
+6. memory: save durable notes | done: memory files updated
+7. output-cleanup: keep deliverables only | done: KEEP list checked
 ```
 
 Put the run settings where they apply (N jobs, target score, rounds, sites,
@@ -44,8 +42,9 @@ subagent's message.
 
 For each item: set it `in_progress` -> delegate / do it -> verify its "done"
 from the files -> set it `completed`. One `write_todos` call per change, never in
-parallel with another `write_todos`. Items the workflow runs side by side (the
-jobs' rounds) may be `in_progress` together and delegated in one message.
+parallel with another `write_todos`. Items the workflow runs in parallel (one
+job-optimizer per job) are set `in_progress` together and delegated in ONE
+message; each is completed when its own job's deliverables check out.
 
 ## 3. Change the plan - always through `write_todos`
 
@@ -55,8 +54,7 @@ in execution order, and say in your next message what changed and why.
 
 | Trigger | Change |
 |---|---|
-| a job's score is below target and still improving | add "builder round k+1" and "ATS review round k+1" for that job |
-| a loop stopped (target met, gain < minimum, max rounds) | remove that job's remaining round items |
+| a job's optimizer failed or left deliverables missing | re-launch that one job's optimizer; the others stay completed |
 | a site blocked / needed login | edit the search item: next site, note the skipped one |
 | a step failed twice | mark what was done, remove the rest of that branch, carry on |
 | **the user adds or changes something** ("also Bangalore", "only 1 job", "skip cleanup", "stop after round 1", "use this job URL instead") | apply their words to the pending items: add, remove, reorder, change parameters - then continue with the next item |

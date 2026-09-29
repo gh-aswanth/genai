@@ -12,12 +12,18 @@ the mounted output folder. The only non-sandbox tools are the Playwright MCP
 browser tools, because the sandbox has no network.
 
 ```
-jobhunter (main)                  write_todos, task, fs tools, execute
-├── job-search      Playwright MCP browser tools   -> /output/jobs/jobs.json
-├── job-matcher     ATS scoring, required skills   -> /output/match/match_report.{json,md}
-├── resume-builder  per job, per round             -> redline / review / final .docx
-└── ats-reviewer    per job, per round             -> fixed ATS score + feedback (loop until done)
+jobhunter (main, orchestrator)
+├── job-search       Playwright MCP browser tools       -> /output/jobs/jobs.json
+├── job-matcher      ATS scoring, best N jobs            -> /output/match/match_report.{json,md}
+├── job-optimizer    ONE PER JOB, ALL IN PARALLEL        -> /output/resume/<rank>-<slug>/
+│   ├── resume-builder   round k: redline / review / final .docx
+│   └── ats-reviewer     round k: fixed ATS score + feedback (loop until done)
+└── ats-reviewer     score-only workflow (your resume as it is)
 ```
+
+For N selected jobs the orchestrator launches N job-optimizers in one message;
+each owns its job's whole builder <-> reviewer loop, so two jobs take about as
+long as one.
 
 ## Run
 
@@ -106,8 +112,18 @@ in its own style, one colour per agent:
 | `node_start` / `node_end` | graph steps (model, tools, middleware) - with `--verbose` |
 | `custom` | custom events dispatched by tools or middleware |
 
+**Parallel lanes.** Every task the orchestrator delegates is a lane with a
+label - the brief's `[job 1: acme-backend]` prefix (the orchestrator is told to
+add one), else the job folder, else `<agent> #n`. Every line from inside a lane
+is tagged `[lane › agent]` in the lane's own colour, including the nested
+builder and reviewer, so interleaved output of N concurrent job optimizers stays
+readable. A panel announces "⇉ N tasks launched in parallel", each lane prints
+"▶ started · N running in parallel" and "■ finished in 42.3s · M still running"
+(✗ in red if it failed), and a table closes the batch: lane, agent, status,
+time, model / tool calls, errors, result.
+
 Each turn ends with a summary table (model and tool calls per agent, errors,
-input tokens and how many came from the prompt cache). Your own listeners can
+input tokens and how many came from the prompt cache, one line per lane). Your own listeners can
 subscribe too: `stream.on("tool_error", my_handler)`.
 
 ## Planning: todos, completed to the end

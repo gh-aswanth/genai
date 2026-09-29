@@ -1,17 +1,17 @@
 ---
 name: jobhunt-workflow
-description: The full job hunt - search the web for jobs, match them against the resume and pick the best N, then tailor the resume for each through the resume-optimization loop, and clean up. The file contract between job-search, job-matcher, resume-builder and ats-reviewer. Use when the user wants jobs found and the resume tailored.
+description: The full job hunt - search the web for jobs, match them against the resume and pick the best N, then tailor the resume for all of them in parallel (one job-optimizer per job, see resume-optimization), and clean up. The file contract between job-search, job-matcher and the job optimizers. Use when the user wants jobs found and the resume tailored.
 ---
 
 # Full job hunt
 
-## Steps (one todo each; step 3 adds todos per job and round)
+## Steps (one todo each; step 3 is one todo per job, all running in parallel)
 
 | Step | Subagent | Reads | Writes |
 |------|----------|-------|--------|
 | 1 | `job-search` | the user's criteria | `/output/jobs/jobs.json`, `/output/jobs/search_notes.md` |
 | 2 | `job-matcher` | resume + `jobs.json` | `/output/match/match_report.json` (with `selected_jobs`), `.md` |
-| 3 | loop: `resume-builder` + `ats-reviewer` | per selected job | see `resume-optimization` |
+| 3 | `job-optimizer` x N, **in parallel** (one message) | one selected job each | its job folder - see `resume-optimization` |
 | 4 | you | everything | the final report (collect facts), then `output-cleanup` |
 
 ## Briefs

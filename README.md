@@ -168,8 +168,9 @@ ATS-ready final - improving each round from an independent ATS review.
 | orchestrator (main agent) | routes the request to a workflow skill, plans it as a todo list, delegates, verifies, reports |
 | `job-search` subagent | finds postings with a real browser (Playwright MCP) |
 | `job-matcher` subagent | scores jobs against the resume, picks the best N, writes per-job change lists |
-| `resume-builder` subagent | writes and runs Python that edits a copy of the resume as tracked changes |
-| `ats-reviewer` subagent | scores each version with a fixed script and gives feedback; the loop repeats until the target score |
+| `job-optimizer` subagent | one per selected job, **all running in parallel**; owns that job's whole loop with its own two subagents: |
+| &nbsp;&nbsp;↳ `resume-builder` | writes and runs Python that edits a copy of the resume as tracked changes |
+| &nbsp;&nbsp;↳ `ats-reviewer` | scores each version with a fixed script and gives feedback; the loop repeats until the target score |
 
 **Workflows:** full job hunt - tailor for a job you give (URL or description) -
 ATS score only (no edits) - find jobs only - cleanup.

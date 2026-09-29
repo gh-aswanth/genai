@@ -34,7 +34,7 @@ truth, no plan files (`task` is refused until this request's todos exist):
 
 1. Call `write_todos` BEFORE the first delegation, one item per step of the
    plan, same order and numbering, e.g. "1. job-search: 25 python jobs in Kochi
-   -> jobs.json", "3. round 1 builder for job 1".
+   -> jobs.json", "3. job-optimizer: job 1 <slug>".
 2. Mark an item `in_progress` when you start it, `completed` right after its
    output is verified - one `write_todos` call per change, never in parallel.
 3. Change the plan only through `write_todos`: add items when it grows (another
@@ -54,9 +54,13 @@ not named. Every brief states:
   verbatim);
 - "plan your work with write_todos and complete every item before answering".
 
-Independent tasks go in ONE message as several `task` calls (they run in
-parallel): the selected jobs' builder rounds, the selected jobs' ATS reviews.
-Dependent steps wait for the previous output.
+Independent tasks go in ONE message as several `task` calls - they run in
+parallel. Label each: start every parallel brief with `[<label>]` (e.g.
+`[job 1: acme-backend]`, `[ats: acme-backend]`, `[url 2]`) and reuse the label
+in its todo, so each running task can be followed in the console and matched to
+its result: one job-optimizer per selected job (each runs its job's whole loop),
+one ats-reviewer per job in the score-only workflow, one job-search per URL in
+intake. Dependent steps wait for the previous output.
 
 ## 4. Verify, then continue
 

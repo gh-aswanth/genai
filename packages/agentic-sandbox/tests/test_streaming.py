@@ -251,7 +251,10 @@ def test_rendered_output():
     text = render(show_nodes=False)
     assert "[jobhunter] task → ats-reviewer" in text
     assert "Score the resume (score-only)." in text
-    assert "[ats-reviewer] ▶ started" in text and "[ats-reviewer] ■ finished" in text
+    assert (
+        "[ats-reviewer #1 › ats-reviewer] ▶ started" in text
+        and "[ats-reviewer #1 › ats-reviewer] ■ finished" in text
+    )
     assert "plan 0/1" in text and "plan 1/1" in text
     assert "write_file /output/ats/score.py" in text and "print(72.5)" in text
     assert "✓ write_file" in text
@@ -277,3 +280,238 @@ def test_cli_turn_uses_the_event_stream():
     asyncio.run(_run_turn(graph, "score my resume", "t1", console=console))
     text = console.export_text()
     assert "task → ats-reviewer" in text and "run summary" in text
+
+
+# -- parallel lanes ---------------------------------------------------------------------------
+
+from genai_agentic_sandbox.streaming import lane_label
+
+
+@pytest.mark.parametrize(
+    ("brief", "expected"),
+    [
+        ("[job 1: acme-backend] Tailor the resume...", "job 1: acme-backend"),
+        ("Tailor for folder /output/resume/2-globex-platform/ please", "job 2: globex-platform"),
+        ('mode "score-only", folder /output/ats/initech-ml/', "ats: initech-ml"),
+        ("job beta, round 1", "job beta"),
+        ("find 25 jobs in Kochi", "job-search #4"),
+        (None, "task #1"),
+    ],
+)
+def test_lane_label(brief, expected):
+    subagent = "job-search" if brief == "find 25 jobs in Kochi" else None
+    n = 4 if subagent else 1
+    assert lane_label(brief, subagent, n) == expected
+
+
+JOBS = {
+    "alpha": "job 1: acme-backend",
+    "beta": "job 2: globex-platform",
+    "gamma": "job 3: initech-ml",
+}
+
+
+class RoutedModel(BaseChatModel):
+    """One script per (agent, job): concurrent subagents must not share steps."""
+
+    scripts: dict = Field(default_factory=dict)
+
+    @property
+    def _llm_type(self) -> str:
+        return "routed"
+
+    def bind_tools(self, tools, **kwargs):
+        return self
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        import threading
+        import time
+
+        system = str(messages[0].content)
+        brief = next((str(m.content) for m in messages if m.type == "human"), "")
+        role = (
+            "orch"
+            if "You are JobHunter" in system
+            else "opt"
+            if "job optimizer" in system
+            else "build"
+        )
+        job = "" if role == "orch" else next(j for j in JOBS if f"job {j}" in brief)
+        time.sleep(0.05)  # let the lanes interleave
+        with self.__dict__.setdefault("_lock", threading.Lock()):
+            message = self.scripts[(role, job)].pop(0)
+        return ChatResult(generations=[ChatGeneration(message=message)])
+
+
+def parallel_graph():
+    def tc(prefix, name, args, n):
+        return AIMessage(
+            content="", tool_calls=[{"name": name, "args": args, "id": f"{prefix}{n}"}]
+        )
+
+    scripts = {
+        ("orch", ""): [
+            tc(
+                "o",
+                "write_todos",
+                {
+                    "todos": [
+                        {"content": f"[{lane}] job-optimizer", "status": "in_progress"}
+                        for lane in JOBS.values()
+                    ]
+                },
+                1,
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "task",
+                        "id": f"t-{j}",
+                        "args": {
+                            "subagent_type": "job-optimizer",
+                            "description": f"[{lane}] job {j}: tailor",
+                        },
+                    }
+                    for j, lane in JOBS.items()
+                ],
+            ),
+            tc(
+                "o",
+                "write_todos",
+                {
+                    "todos": [
+                        {"content": f"[{lane}] job-optimizer", "status": "completed"}
+                        for lane in JOBS.values()
+                    ]
+                },
+                2,
+            ),
+            AIMessage(content="All 3 jobs tailored."),
+        ]
+    }
+    for j in JOBS:
+        scripts[("opt", j)] = [
+            tc(
+                f"p{j}",
+                "write_todos",
+                {"todos": [{"content": "1. build", "status": "in_progress"}]},
+                1,
+            ),
+            tc(
+                f"p{j}",
+                "task",
+                {"subagent_type": "resume-builder", "description": f"job {j}, round 1"},
+                2,
+            ),
+            tc(
+                f"p{j}",
+                "write_todos",
+                {"todos": [{"content": "1. build", "status": "completed"}]},
+                3,
+            ),
+            AIMessage(content=f"job {j}: best round 1"),
+        ]
+        scripts[("build", j)] = [
+            tc(
+                f"b{j}",
+                "write_todos",
+                {"todos": [{"content": "1. build", "status": "in_progress"}]},
+                1,
+            ),
+            tc(f"b{j}", "ls", {"path": "/"}, 2),
+            tc(
+                f"b{j}",
+                "write_todos",
+                {"todos": [{"content": "1. build", "status": "completed"}]},
+                3,
+            ),
+            AIMessage(content=f"built {j}"),
+        ]
+    model = RoutedModel(scripts=scripts)
+    graph = create_jobhunter_agent(
+        model=model,
+        backend=StateBackend(),
+        browser_tools=[],
+        resume_path="/input/cv.docx",
+        memory=False,
+    )
+    return graph, model
+
+
+PARALLEL_INPUT = {"messages": [{"role": "user", "content": "tailor for 3 jobs"}]}
+CONFIG = {"recursion_limit": 100}
+
+
+@pytest.fixture(scope="module")
+def lane_events():
+    graph, model = parallel_graph()
+
+    async def go():
+        return [e async for e in EventStream().events(graph, PARALLEL_INPUT, CONFIG)]
+
+    events = asyncio.run(go())
+    assert all(not s for s in model.scripts.values())
+    return events
+
+
+def test_every_event_inside_a_lane_is_labelled(lane_events):
+    for event in lane_events:
+        if event.agent in ("job-optimizer", "resume-builder"):
+            assert event.lane in JOBS.values(), event
+        if (
+            event.agent == "jobhunter"
+            and event.kind != "subagent_start"
+            and event.kind != "subagent_end"
+        ):
+            assert event.lane is None, event
+
+
+def test_nested_events_keep_their_lane_and_path(lane_events):
+    builder_tools = [
+        e for e in lane_events if e.kind == "tool_start" and e.agent == "resume-builder"
+    ]
+    assert {e.lane for e in builder_tools} == set(JOBS.values())
+    assert all(
+        e.path == ("job-optimizer", "resume-builder") and e.depth == 2 for e in builder_tools
+    )
+
+
+def test_lanes_overlap_and_are_counted(lane_events):
+    starts = [
+        e for e in lane_events if e.kind == "subagent_start" and e.data.get("running") is not None
+    ]
+    assert [e.data["running"] for e in starts] == [1, 2, 3]
+    assert [e.lane for e in starts] == list(JOBS.values())
+    ends = [
+        e
+        for e in lane_events
+        if e.kind == "subagent_end" and e.data.get("still_running") is not None
+    ]
+    assert sorted(e.data["still_running"] for e in ends) == [0, 1, 2]
+    first_end = lane_events.index(ends[0])
+    assert all(
+        lane_events.index(s) < first_end for s in starts
+    )  # all 3 started before any finished
+    nested = [
+        e for e in lane_events if e.kind == "subagent_start" and e.data.get("running") is None
+    ]
+    assert len(nested) == 3 and {e.lane for e in nested} == set(JOBS.values())
+
+
+def test_parallel_rendering():
+    graph, _ = parallel_graph()
+    console = Console(record=True, width=140)
+    stream = EventStream()
+    renderer = RichRenderer(console).attach(stream)
+    asyncio.run(stream.run(graph, PARALLEL_INPUT, CONFIG))
+    renderer.summary()
+    text = console.export_text()
+    assert "⇉ 3 tasks launched in parallel" in text
+    assert "3 running in parallel" in text and "still running" in text
+    for lane in JOBS.values():
+        assert f"[{lane} › resume-builder] 🔧 ls /" in text
+        assert f"■ {lane}  job-optimizer finished in" in text
+    assert "parallel batch: 3 tasks" in text
+    assert "lane job 1: acme-backend" in text  # per-lane line in the run summary
+    assert all(renderer.lanes[lane]["status"] == "done" for lane in JOBS.values())
