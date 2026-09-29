@@ -202,6 +202,20 @@ class EventStream:
         """How many of the orchestrator's tasks (parallel lanes) are running now."""
         return sum(1 for t in self._task_runs.values() if t.top_level)
 
+    def _lane(self, raw: dict) -> tuple[str | None, tuple[str, ...]]:
+        """(lane, subagent path) from the `task` runs among the parents (root first)."""
+        tasks = [self._task_runs[p] for p in raw.get("parent_ids") or [] if p in self._task_runs]
+        return (tasks[0].lane if tasks else None), tuple(t.subagent for t in tasks)
+
+    @property
+    def running(self) -> dict[str, TaskRun]:
+        """Tasks started and not finished yet, by run id."""
+        return dict(self._task_runs)
+
+    def lanes_running(self) -> int:
+        """How many of the orchestrator's tasks (parallel lanes) are running now."""
+        return sum(1 for t in self._task_runs.values() if t.top_level)
+
     def classify(self, raw: dict) -> AgentEvent | None:
         event, name = raw.get("event", ""), raw.get("name", "")
         metadata, data = raw.get("metadata") or {}, raw.get("data") or {}
@@ -795,6 +809,43 @@ class RichRenderer:
         return Text.assemble(
             ("·" * a, "dim"), ("█" * (b - a), self.lane_colour(lane)), ("·" * (width - b), "dim")
         )
+        if still == 0 and len(self._batch) > 1:
+            self._batch_table()
+        if still == 0:
+            self._batch = []
+
+    def _batch_table(self) -> None:
+        table = Table(title=f"parallel batch: {len(self._batch)} tasks", header_style="bold")
+        for column in (
+            "lane",
+            "agent",
+            "status",
+            "time",
+            "model calls",
+            "tool calls",
+            "errors",
+            "result",
+        ):
+            table.add_column(
+                column,
+                justify="right"
+                if column in ("time", "model calls", "tool calls", "errors")
+                else "left",
+            )
+        for lane in self._batch:
+            st = self.lanes.get(lane, {})
+            status = st.get("status", "?")
+            table.add_row(
+                Text(lane, style=f"bold {self.lane_colour(lane)}"),
+                st.get("subagent", ""),
+                Text(status, style="red" if status == "failed" else "green"),
+                f"{st.get('seconds', 0.0):.1f}s",
+                str(st.get("model", 0)),
+                str(st.get("tools", 0)),
+                str(st.get("errors", 0)),
+                st.get("result", ""),
+            )
+        self.console.print(table)
 
     # -- graph nodes -----------------------------------------------------------------
 
