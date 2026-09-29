@@ -32,7 +32,7 @@ uv run genai-agentic-sandbox --resume ~/cv.docx     # interactive session
 
 Options: `--top-jobs N` (default 2), `--target-score` (85), `--max-rounds` (3),
 `--keep-work-files`, `--memory-dir` (default `<out>/memories`), `--no-memory`,
-`--prompt-cache-retention {in_memory,24h}`, `--model`, `--headed`, `--no-verify`.
+`--prompt-cache-retention {in_memory,24h}`, `--verbose`, `--model`, `--headed`, `--no-verify`.
 
 Your resume is never modified. Before anything runs it is checked (a .docx with
 real text - a blank document is rejected with an error), copied to
@@ -89,6 +89,26 @@ request, and follows the matching workflow skill (`skills/orchestrator/`):
 `output-cleanup` runs last (dry run first) and deletes every working file,
 keeping only the .docx deliverables; pass `--keep-work-files` to keep scripts,
 JSON, round folders and logs.
+
+## Live view (event stream v2 + Rich)
+
+`streaming.py` consumes `astream_events(..., version="v2")`, classifies every
+event and sends it to the listener for its kind; `RichRenderer` draws each kind
+in its own style, one colour per agent:
+
+| kind | shown as |
+|---|---|
+| `agent_start` / `agent_end` | a rule for the orchestrator; "▶ started / ■ finished" for subagents (indented by depth) |
+| `subagent_start` / `subagent_end` | a panel "task → <subagent>" with the brief; a result panel with its answer |
+| `model_start` / `model_token` / `model_end` | the orchestrator's answer streamed live as Markdown; token and cache usage |
+| `tool_start` / `tool_end` / `tool_error` | the call with syntax-highlighted code / command / arguments; ✓ with timing; ✗ in red |
+| `todos` | the agent's plan as a table (✔ ◐ ○) every time it changes |
+| `node_start` / `node_end` | graph steps (model, tools, middleware) - with `--verbose` |
+| `custom` | custom events dispatched by tools or middleware |
+
+Each turn ends with a summary table (model and tool calls per agent, errors,
+input tokens and how many came from the prompt cache). Your own listeners can
+subscribe too: `stream.on("tool_error", my_handler)`.
 
 ## Planning: todos, completed to the end
 
@@ -170,6 +190,7 @@ src/genai_agentic_sandbox/
 ├── prompts.py         # prompts and the /output file contract
 ├── middleware.py      # TodoCompletionMiddleware
 ├── caching.py         # OpenAI prompt caching; Anthropic caching removed
+├── streaming.py       # event stream v2 -> listeners per kind -> Rich console
 ├── memory.py          # long-term memory files, seeding, subagent memory, guard
 ├── skills/            # SKILL.md files, mounted at /skills
 │   ├── orchestrator/  # main agent: agent-orchestration, jobhunt-workflow,

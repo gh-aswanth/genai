@@ -149,25 +149,3 @@ def test_cli_rejects_bad_loop_settings(resume, tmp_path, monkeypatch, capsys, fl
     code = main(["--resume", str(resume), "--out", str(tmp_path / "out"), *flags, "find jobs"])
     assert code == 2
     assert "--max-rounds >= 1" in capsys.readouterr().err
-
-
-def test_the_plan_is_shown_in_full_when_it_changes(capsys):
-    from genai_agentic_sandbox.main import _print_stream_chunk, format_todos
-    from langchain_core.messages import AIMessage
-
-    todos = [
-        {"content": "1. search", "status": "completed"},
-        {"content": "2. match", "status": "in_progress"},
-        {"content": "3. build", "status": "pending"},
-    ]
-    assert format_todos("jobhunter", todos).splitlines() == [
-        "  [jobhunter] plan - 1/3 done",
-        "      [x] 1. search",
-        "      [~] 2. match",
-        "      [ ] 3. build",
-    ]
-    message = AIMessage(
-        content="", tool_calls=[{"name": "write_todos", "args": {"todos": todos}, "id": "1"}]
-    )
-    _print_stream_chunk(("tools:abc",), {"model": {"messages": [message]}})
-    assert "[tools] plan - 1/3 done" in capsys.readouterr().out

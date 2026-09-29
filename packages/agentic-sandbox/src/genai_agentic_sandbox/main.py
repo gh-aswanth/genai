@@ -32,7 +32,6 @@ import zipfile
 from pathlib import Path
 
 from genai_agentic_sandbox.agent import SKILLS_MOUNT, create_jobhunter_agent
-from genai_agentic_sandbox.caching import cache_stats
 from genai_agentic_sandbox.memory import (
     MEMORY_DIRNAME,
     MEMORY_MOUNT,
@@ -161,85 +160,35 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         default=None,
         help="OpenAI prompt cache retention (24h needs a model that supports it)",
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="also show graph nodes (model / tools / middleware steps) and per-call token usage",
+    )
     parser.add_argument("--headed", action="store_true", help="show the browser window")
     parser.add_argument("--no-verify", action="store_true", help="skip sandbox image check")
     return parser.parse_args(argv)
 
 
-_TODO_MARK = {"completed": "[x]", "in_progress": "[~]", "pending": "[ ]"}
+async def _run_turn(
+    agent, text: str, thread_id: str, *, verbose: bool = False, console=None
+) -> None:
+    """One request, streamed live: LangChain event stream v2 -> listeners -> Rich."""
+    from genai_agentic_sandbox.streaming import EventStream, RichRenderer
 
-
-def format_todos(who: str, todos: list[dict]) -> str:
-    """The plan (todo list) as the terminal shows it whenever an agent updates it."""
-    done = sum(t.get("status") == "completed" for t in todos)
-    lines = [f"  [{who}] plan - {done}/{len(todos)} done"]
-    lines += [
-        f"      {_TODO_MARK.get(t.get('status'), '[ ]')} {t.get('content', '')}" for t in todos
-    ]
-    return "\n".join(lines)
-
-
-def _print_stream_chunk(namespace: tuple, update: dict) -> None:
-    """Print tool calls (main and subagents) and the main agent's replies."""
-    who = namespace[-1].split(":")[0] if namespace else "jobhunter"
-    for data in update.values():
-        if not isinstance(data, dict):
-            continue
-        messages = data.get("messages")
-        if not isinstance(messages, list):
-            continue
-        for message in messages:
-            if getattr(message, "type", None) != "ai":
-                continue
-            for call in getattr(message, "tool_calls", None) or []:
-                args = call["args"]
-                if call["name"] == "write_todos":  # the plan: show it in full
-                    print(format_todos(who, args.get("todos") or []))
-                    continue
-                if call["name"] == "task":
-                    args = {
-                        "subagent": args.get("subagent_type"),
-                        "task": str(args.get("description"))[:200],
-                    }
-                print(f"  [{who}] -> {call['name']}({str(args)[:160]})")
-            if message.content and not namespace and not getattr(message, "tool_calls", None):
-                text = message.content if isinstance(message.content, str) else message.text
-                print(f"\njobhunter > {text}\n")
-
-
-def _ai_messages(update: dict) -> list:
-    out = []
-    for data in update.values():
-        messages = data.get("messages") if isinstance(data, dict) else None
-        if isinstance(messages, list):
-            out += [m for m in messages if getattr(m, "type", None) == "ai"]
-    return out
-
-
-async def _run_turn(agent, text: str, thread_id: str) -> None:
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 1000}
-    seen = []
-    async for namespace, update in agent.astream(
-        {"messages": [{"role": "user", "content": text}]},
-        config=config,
-        stream_mode="updates",
-        subgraphs=True,
-    ):
-        _print_stream_chunk(namespace, update)
-        seen += _ai_messages(update)
-    stats = cache_stats(seen)
-    if stats["input_tokens"]:
-        share = 100 * stats["cached_tokens"] / stats["input_tokens"]
-        print(
-            f"[prompt cache] {stats['cached_tokens']:,} of {stats['input_tokens']:,} input "
-            f"tokens served from OpenAI's cache ({share:.0f}%) over {stats['calls']} calls"
-        )
+    stream = EventStream()
+    renderer = RichRenderer(console, show_nodes=verbose).attach(stream)
+    try:
+        await stream.run(agent, {"messages": [{"role": "user", "content": text}]}, config)
+    finally:
+        renderer.summary()
 
 
-async def _chat(agent, first: str | None) -> None:
+async def _chat(agent, first: str | None, *, verbose: bool = False) -> None:
     thread = f"session-{uuid.uuid4().hex[:8]}"
     if first:
-        await _run_turn(agent, first, thread)
+        await _run_turn(agent, first, thread, verbose=verbose)
         return
     print(BANNER)
     while True:
@@ -258,7 +207,7 @@ async def _chat(agent, first: str | None) -> None:
             print("New session. Files in the output folder are kept.\n")
             continue
         try:
-            await _run_turn(agent, text, thread)
+            await _run_turn(agent, text, thread, verbose=verbose)
         except KeyboardInterrupt:
             print("\n[stopped]\n")
         except Exception as exc:  # noqa: BLE001 - keep the session alive
@@ -323,7 +272,7 @@ async def run(args: argparse.Namespace) -> int:
                 cache_retention=args.prompt_cache_retention,
                 checkpointer=MemorySaver(),
             )
-            await _chat(agent, args.task)
+            await _chat(agent, args.task, verbose=args.verbose)
     if memory_dir:
         print(describe_memory(memory_dir))
     return 0
