@@ -3,13 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import types
 
 import pytest
 from deepagents.backends import StateBackend
 from genai_agentic_sandbox.agent import create_jobhunter_agent
 from genai_agentic_sandbox.main import _run_turn
-from genai_agentic_sandbox.streaming import KINDS, AgentEvent, EventStream, RichRenderer
+from genai_agentic_sandbox.streaming import (
+    KINDS,
+    AgentEvent,
+    EventStream,
+    RichRenderer,
+    short_lane,
+)
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
@@ -288,6 +295,19 @@ from genai_agentic_sandbox.streaming import lane_label
 
 
 @pytest.mark.parametrize(
+    ("label", "badge"),
+    [
+        ("job 1: acme-backend", "job 1"),
+        ("job alpha: tailor", "job alpha"),
+        ("ats: acme-backend", "ats: acme-back"),
+        ("job-optimizer #3", "job-optimizer "),
+    ],
+)
+def test_short_lane(label, badge):
+    assert short_lane(label) == badge
+
+
+@pytest.mark.parametrize(
     ("brief", "expected"),
     [
         ("[job 1: acme-backend] Tailor the resume...", "job 1: acme-backend"),
@@ -512,6 +532,88 @@ def test_parallel_rendering():
     for lane in JOBS.values():
         assert f"[{lane} › resume-builder] 🔧 ls /" in text
         assert f"■ {lane}  job-optimizer finished in" in text
+    # A tool call's argument box is titled with its job: no anonymous boxes.
+    tool_boxes = [line for line in text.splitlines() if "🔧" in line]
+    assert len(tool_boxes) == 3 and all(line.startswith("╭─") for line in tool_boxes)
+    assert all(any(f"[{lane} ›" in line for lane in JOBS.values()) for line in tool_boxes)
     assert "parallel batch: 3 tasks" in text
     assert "lane job 1: acme-backend" in text  # per-lane line in the run summary
+    # Start and end of every job: clock times on the lines, in the batch table and
+    # the run summary, and a timeline bar per job on the batch's time axis.
+    clock = r"\d\d:\d\d:\d\d"
+    for lane in JOBS.values():
+        st = renderer.lanes[lane]
+        assert st["started_at"] < st["ended_at"]
+        assert re.search(rf"▶ {lane}  job-optimizer started at {clock}", text)
+        assert re.search(rf"■ {lane}  job-optimizer finished in [\d.]+s at {clock}", text)
+        row = next(line for line in text.splitlines() if line.startswith(f"│ {lane} "))
+        assert len(re.findall(clock, row)) == 2 and "█" in row, row
+    assert re.search(rf"timeline: {clock} → {clock}", text)
+    assert re.search(rf"lane job 1: acme-backend .*\({clock} → {clock}\)", text)
     assert all(renderer.lanes[lane]["status"] == "done" for lane in JOBS.values())
+
+
+def test_parallel_lanes_stream_in_their_own_windows():
+    graph, _ = parallel_graph()
+    console = Console(record=True, width=180, height=60)
+    stream = EventStream()
+    renderer = RichRenderer(console, windows=True).attach(stream)
+    asyncio.run(stream.run(graph, PARALLEL_INPUT, CONFIG))
+    renderer.summary()
+    text = console.export_text()
+    assert not renderer.windows.active  # closed when the last lane finished
+    # Lane lines go to the lane's window, not interleaved into the scrollback.
+    assert "› resume-builder] 🔧" not in text
+    for lane in JOBS.values():
+        window = renderer.windows.windows[lane]
+        assert window.status == "done" and window.subagent == "job-optimizer"
+        rows = [line.plain for line in window.lines]
+        badge = lane.split(":")[0]  # "job 1"
+        # Every row after the brief is badged with its job, tool calls included.
+        assert all(r.startswith(f"{badge} › ") for r in rows[1:]), rows
+        assert f"{badge} ›   resume-builder 🔧 ls /" in rows, rows
+        assert f"{badge} › job-optimizer task → resume-builder  job" in "\n".join(rows), rows
+        assert "job-optimizer" in window.plans
+        assert f" {lane} job-optimizer" in text  # the window's title in the final frame
+        assert f"■ {lane}  job-optimizer finished in" in text
+    assert "✔ done" in text
+    assert "parallel batch: 3 tasks" in text
+
+
+def test_windows_default_to_interactive_terminals_only():
+    assert not RichRenderer(Console(record=True, force_terminal=False)).use_windows
+    assert RichRenderer(Console(force_terminal=True)).use_windows
+
+
+def test_lanes_survive_truncated_parent_ids():
+    """With LangSmith tracing on, v2 events carry only their immediate parent id;
+    the lane must then come from the checkpoint namespace (the bug: every lane
+    showed 0 model / 0 tool calls)."""
+    graph, _ = parallel_graph()
+
+    async def raw_events():
+        return [raw async for raw in graph.astream_events(PARALLEL_INPUT, CONFIG, version="v2")]
+
+    raws = asyncio.run(raw_events())
+    full = [
+        (e.kind, e.agent, e.lane, e.path, e.depth) for e in map(EventStream().classify, raws) if e
+    ]
+    cut = EventStream()
+    truncated = [
+        cut.classify({**raw, "parent_ids": (raw.get("parent_ids") or [])[-1:]}) for raw in raws
+    ]
+    assert [(e.kind, e.agent, e.lane, e.path, e.depth) for e in truncated if e] == full
+
+    # ...and the renderer counts every lane's calls from them.
+    renderer = RichRenderer(Console(record=True, width=140))
+    stream = EventStream()
+    renderer.attach(stream)
+
+    async def replay():
+        for raw in raws:
+            if event := stream.classify({**raw, "parent_ids": (raw.get("parent_ids") or [])[-1:]}):
+                await stream.dispatch(event)
+
+    asyncio.run(replay())
+    for lane in JOBS.values():
+        assert renderer.lanes[lane]["model"] == 8 and renderer.lanes[lane]["tools"] == 1

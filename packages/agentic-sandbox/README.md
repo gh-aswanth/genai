@@ -116,11 +116,25 @@ in its own style, one colour per agent:
 label - the brief's `[job 1: acme-backend]` prefix (the orchestrator is told to
 add one), else the job folder, else `<agent> #n`. Every line from inside a lane
 is tagged `[lane › agent]` in the lane's own colour, including the nested
-builder and reviewer, so interleaved output of N concurrent job optimizers stays
+builder and reviewer and the title of every tool call's code / arguments box, so interleaved output of N concurrent job optimizers stays
 readable. A panel announces "⇉ N tasks launched in parallel", each lane prints
-"▶ started · N running in parallel" and "■ finished in 42.3s · M still running"
-(✗ in red if it failed), and a table closes the batch: lane, agent, status,
-time, model / tool calls, errors, result.
+"▶ started at 14:02:11 · N running in parallel" and "■ finished in 42.3s at
+14:02:53 · M still running" (✗ in red if it failed), and a table closes the
+batch: lane, agent, status, started, ended, time, a timeline bar on the batch's
+time axis (overlapping bars ran at the same time), model / tool calls, errors,
+result. The run summary repeats each lane's start → end.
+
+**One window per job.** In an interactive terminal the lanes do not interleave:
+while they run, a live grid (`LaneWindows`) gives each lane its own window, side
+by side (as many columns as fit, 56+ characters each). A window shows the lane's
+brief, one plan line per agent (`plan 2/5 job-optimizer ◐ round 2: ats-reviewer`),
+a scrolling log of its agents' steps, every row badged with its job (`job 1 › …`) (nested builder / reviewer indented: task →,
+🔧 tool, ✓ / ✗ result, 💬 answer) and, at the bottom, the model text streaming
+in that lane right now; the footer has its status, time and model / tool calls.
+The orchestrator's own lines and each lane's result panel print above the grid,
+and the final frame stays on screen when the last lane ends. `--no-windows` (or
+`RichRenderer(windows=False)`, the default when output is not a terminal) keeps
+the interleaved `[lane › agent]` lines.
 
 Each turn ends with a summary table (model and tool calls per agent, errors,
 input tokens and how many came from the prompt cache, one line per lane). Your own listeners can
