@@ -1,5 +1,7 @@
 # genai
 
+![GenAI - a monorepo of GenAI workflow projects](static/top_lbl.png)
+
 A monorepo of independent **GenAI workflow projects**, managed as a single
 [uv](https://docs.astral.sh/uv/) workspace. Each project lives in its own folder
 under `packages/`, has its own `pyproject.toml`, dependencies, tests and README,
@@ -37,6 +39,7 @@ genai/
 ├── .env.example          environment variables used by the projects
 ├── .mcp.json             MCP servers for Claude Code (LangChain + OpenAI docs)
 ├── .claude/skills/       project skills for Claude Code (Qdrant skills)
+├── static/               images used by the READMEs (banner, screenshots)
 └── packages/             one folder per project
     └── agentic-sandbox/  genai-agentic-sandbox (JobHunter)
         ├── pyproject.toml
@@ -172,6 +175,28 @@ ATS-ready final - improving each round from an independent ATS review.
 | &nbsp;&nbsp;↳ `resume-builder` | writes and runs Python that edits a copy of the resume as tracked changes |
 | &nbsp;&nbsp;↳ `ats-reviewer` | scores each version with a fixed script and gives feedback; the loop repeats until the target score |
 
+**See it run:**
+
+Parallel subagents stream live, each in its own window: its plan, every tool
+call badged with the lane (`site 1: linkedin › job-search 🔧 …`), and its status,
+time and model / tool / error counts. Here, five `job-search` subagents search
+five job sites at the same time:
+
+![Five job-search subagents running in parallel, one live window each](static/img.png)
+
+When the last lane finishes, a summary table shows when each one started and
+ended, a timeline bar per lane (overlapping bars ran at the same time), and its
+model calls, tool calls, errors and result:
+
+![Parallel batch summary: start, end, duration, timeline and call counts per lane](static/parallel_agent.png)
+
+The output is your own resume in Word review mode: every edit is a tracked
+change, colour-coded (green added, red removed, blue rephrased, ...), with a
+comment explaining why it helps the ATS score. Reject All gives back the
+original; the `*_final.docx` has every change applied.
+
+![A tailored resume in Word review mode with tracked changes and reviewer comments](static/resume_rebuild.png)
+
 **Workflows:** full job hunt - tailor for a job you give (URL or description) -
 ATS score only (no edits) - find jobs only - cleanup.
 
@@ -195,6 +220,8 @@ uv run genai-agentic-sandbox --resume ~/cv.docx --out ./jobhunt-output \
 ```
 
 **Other commands:** `uv run sandbox-build` builds and verifies the sandbox image.
+Pass `--no-windows` to print parallel lanes as interleaved `[lane › agent]`
+lines instead of live windows (the default when output is not a terminal).
 
 <!--
 ### genai-<name> - <short title>
