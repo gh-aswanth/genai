@@ -13,6 +13,7 @@ the best round and writes ats_history.json.
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -186,9 +187,7 @@ def test_builder_reviewer_loop_improves_and_keeps_the_best_round(tmp_path):
         for k in (1, 2)
         for step in ("build", "ATS review")
     ] + [{"content": "finalise job 1", "status": "pending"}]
-    script = [  # the orchestrator writes its plan to disk, then mirrors it in todos
-        call("write_todos", {"todos": plan}),
-    ]
+    script = [call("write_todos", {"todos": plan})]  # the job-optimizer plans its loop
     for k in (1, 2):
         feedback = f" Feedback: {JOB_DIR}/ats/round-{k - 1}.json." if k > 1 else ""
         if k == 1:
@@ -268,6 +267,21 @@ def test_builder_reviewer_loop_improves_and_keeps_the_best_round(tmp_path):
         call("write_todos", {"todos": [dict(t, status="completed") for t in plan]}),
         AIMessage(content="Done: best round kept"),
     ]
+    # The orchestrator delegates the whole loop to one job-optimizer.
+    orch_plan = [{"content": "1. job-optimizer: job 1 acme-backend", "status": "in_progress"}]
+    script = [
+        call("write_todos", {"todos": orch_plan}),
+        call(
+            "task",
+            {
+                "subagent_type": "job-optimizer",
+                "description": f"Job 1 acme-backend (rank 1), resume /input/{STEM}.docx, folder {JOB_DIR}/",
+            },
+        ),
+        *script,
+        call("write_todos", {"todos": [dict(orch_plan[0], status="completed")]}),
+        AIMessage(content="Done: job 1 tailored"),
+    ]
     model = ScriptedModel(script=script)
 
     with SandboxImageBuilder().backend(mounts=sandbox_mounts(copy, out)) as backend:
@@ -287,7 +301,7 @@ def test_builder_reviewer_loop_improves_and_keeps_the_best_round(tmp_path):
         )
 
     assert model.script == []
-    assert result["messages"][-1].content == "Done: best round kept"
+    assert result["messages"][-1].content == "Done: job 1 tailored"
 
     # The right skills reached the right agents (loaded from /skills in the container).
     systems = [str(m[0].content) for m in model.seen]
@@ -507,6 +521,23 @@ def test_memory_persists_across_runs_and_reaches_the_right_agents(tmp_path):
                     "new_string": "## Job preferences\n- Only remote roles (PREF-3X)",
                 },
             ),
+            call(
+                "task",
+                {
+                    "subagent_type": "job-optimizer",
+                    "description": "job 1, folder /output/resume/1-x/",
+                },
+            ),
+            # --- job-optimizer: plans, runs builder + reviewer, completes, answers ---
+            call(
+                "write_todos",
+                {
+                    "todos": [
+                        {"content": "1. build r1", "status": "in_progress"},
+                        {"content": "2. review r1", "status": "pending"},
+                    ]
+                },
+            ),
             call("task", {"subagent_type": "resume-builder", "description": "round 1 for job 1"}),
             *subagent_turns(
                 call,
@@ -526,6 +557,19 @@ def test_memory_persists_across_runs_and_reaches_the_right_agents(tmp_path):
             ),
             call("task", {"subagent_type": "ats-reviewer", "description": "score round 1"}),
             AIMessage(content="score 80"),
+            call(
+                "write_todos",
+                {
+                    "todos": [
+                        {"content": "1. build r1", "status": "completed"},
+                        {"content": "2. review r1", "status": "completed"},
+                    ]
+                },
+            ),
+            AIMessage(
+                content="Job 1 done.\nMemory notes:\n- 'Summary' heading raised sections score (NOTE-5Z)"
+            ),
+            # --- back in the orchestrator ---
             # end of run: curate the subagent's memory note
             call(
                 "edit_file",
@@ -594,3 +638,181 @@ def test_memory_persists_across_runs_and_reaches_the_right_agents(tmp_path):
         agent.invoke({"messages": [{"role": "user", "content": "hi"}]})
     first_prompt = str(run2.seen[0][0].content)
     assert "PREF-3X" in first_prompt and "NOTE-5Z" in first_prompt and "FACT-7Q" in first_prompt
+
+
+class RoutedModel(BaseChatModel):
+    """Concurrent agents need their own scripts: route each call by WHO is asking -
+    the agent (from its system prompt) and the job (from its brief) - so parallel
+    subagents do not consume each other's steps."""
+
+    scripts: dict = Field(default_factory=dict)
+    seen: list = Field(default_factory=list)
+
+    @property
+    def _llm_type(self) -> str:
+        return "routed"
+
+    def bind_tools(self, tools, **kwargs):
+        return self
+
+    @staticmethod
+    def key(messages) -> tuple[str, str]:
+        system = str(messages[0].content)
+        brief = next((str(m.content) for m in messages if m.type == "human"), "")
+        job = next((j for j in ("alpha", "beta") if f"job {j}" in brief), "")
+        for marker, role in (
+            ("You are JobHunter", "orch"),
+            ("You are a job optimizer", "opt"),
+            ("You are the resume builder", "build"),
+        ):
+            if marker in system:
+                return role, job if role != "orch" else ""
+        raise AssertionError(f"unknown agent: {system[:80]}")
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        import threading
+
+        lock = self.__dict__.setdefault("_lock", threading.Lock())
+        key = self.key(messages)
+        with lock:
+            self.seen.append((key, messages))
+            message = self.scripts[key].pop(0)
+        return ChatResult(generations=[ChatGeneration(message=message)])
+
+
+def test_selected_jobs_are_optimised_in_parallel(tmp_path):
+    """Two job-optimizers launched in ONE message run at the same time: their
+    builders' sandbox work overlaps in time."""
+    import time as _time
+
+    user_resume = tmp_path / "home" / f"{STEM}.docx"
+    user_resume.parent.mkdir()
+    user_resume.write_bytes(RESUME)
+    out = tmp_path / "out"
+    copy = prepare_resume(user_resume, out)
+
+    def tc(key, name, args, n):
+        return AIMessage(content="", tool_calls=[{"name": name, "args": args, "id": f"{key}-{n}"}])
+
+    def timed_build(job):
+        folder = f"/output/resume/{job}"
+        code = (
+            "import json, os, time; os.makedirs('" + folder + "', exist_ok=True); s = time.time(); "
+            "time.sleep(3); json.dump({'start': s, 'end': time.time()}, open('"
+            + folder
+            + "/timing.json', 'w'))"
+        )
+        return f'python -c "{code}"'
+
+    scripts = {
+        ("orch", ""): [
+            tc(
+                "o",
+                "write_todos",
+                {
+                    "todos": [
+                        {"content": "1. job-optimizer: job alpha", "status": "in_progress"},
+                        {"content": "2. job-optimizer: job beta", "status": "in_progress"},
+                    ]
+                },
+                1,
+            ),
+            # both optimizers in ONE message -> they run in parallel
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "task",
+                        "args": {
+                            "subagent_type": "job-optimizer",
+                            "description": f"job {j}, folder /output/resume/{j}/",
+                        },
+                        "id": f"o-task-{j}",
+                    }
+                    for j in ("alpha", "beta")
+                ],
+            ),
+            tc(
+                "o",
+                "write_todos",
+                {
+                    "todos": [
+                        {"content": "1. job-optimizer: job alpha", "status": "completed"},
+                        {"content": "2. job-optimizer: job beta", "status": "completed"},
+                    ]
+                },
+                2,
+            ),
+            AIMessage(content="Both jobs tailored."),
+        ],
+    }
+    for job in ("alpha", "beta"):
+        scripts[("opt", job)] = [
+            tc(
+                f"opt-{job}",
+                "write_todos",
+                {"todos": [{"content": "1. build round 1", "status": "in_progress"}]},
+                1,
+            ),
+            tc(
+                f"opt-{job}",
+                "task",
+                {"subagent_type": "resume-builder", "description": f"job {job}, round 1"},
+                2,
+            ),
+            tc(
+                f"opt-{job}",
+                "write_todos",
+                {"todos": [{"content": "1. build round 1", "status": "completed"}]},
+                3,
+            ),
+            AIMessage(content=f"job {job} done"),
+        ]
+        scripts[("build", job)] = [
+            tc(
+                f"b-{job}",
+                "write_todos",
+                {"todos": [{"content": "1. build", "status": "in_progress"}]},
+                1,
+            ),
+            tc(f"b-{job}", "execute", {"command": timed_build(job)}, 2),
+            tc(
+                f"b-{job}",
+                "write_todos",
+                {"todos": [{"content": "1. build", "status": "completed"}]},
+                3,
+            ),
+            AIMessage(content=f"built {job}"),
+        ]
+    model = RoutedModel(scripts=scripts)
+
+    with SandboxImageBuilder().backend(mounts=sandbox_mounts(copy, out)) as backend:
+        agent = create_jobhunter_agent(
+            model=model,
+            backend=backend,
+            browser_tools=[],
+            resume_path=f"/input/{STEM}.docx",
+            top_jobs=2,
+            cleanup=False,
+        )
+        started = _time.monotonic()
+        result = asyncio.run(
+            agent.ainvoke(
+                {"messages": [{"role": "user", "content": "Tailor my resume for both jobs"}]},
+                config={"recursion_limit": 100},
+            )
+        )
+        elapsed = _time.monotonic() - started
+
+    assert all(not script for script in model.scripts.values()), model.scripts
+    assert result["messages"][-1].content == "Both jobs tailored."
+    timings = {
+        j: json.loads((out / "resume" / j / "timing.json").read_text()) for j in ("alpha", "beta")
+    }
+    # The two jobs' sandbox work overlapped: each started before the other finished.
+    assert timings["alpha"]["start"] < timings["beta"]["end"]
+    assert timings["beta"]["start"] < timings["alpha"]["end"]
+    assert elapsed < 3 + 3  # sequential would need both 3 s builds back to back
+    # Each optimizer got its own loop skill; builders ran under their optimizer.
+    optimizer_system = next(str(m[0].content) for k, m in model.seen if k[0] == "opt")
+    assert "job-optimization-loop" in optimizer_system

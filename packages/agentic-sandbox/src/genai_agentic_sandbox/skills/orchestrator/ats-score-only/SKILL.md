@@ -16,7 +16,8 @@ report the user keeps.
    `/output/match/match_report.json`. If no job at all: a generic check - a
    single pseudo-job with slug `general` and empty skill/keyword lists (the
    scorer then rates only sections, format and contact data, and says so).
-2. **Score.** One `ats-reviewer` task per job, all in ONE message (parallel).
+2. **Score.** One `ats-reviewer` task per job, all in ONE message (parallel),
+   each brief starting with its label `[ats: <slug>]`.
    Brief: mode "score-only", the resume path `/input/<resume>.docx` (score it as
    is), job id / slug, output folder `/output/ats/<slug>/`, no target.
    Each writes `/output/ats/<slug>/round-1.json`.

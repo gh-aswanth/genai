@@ -8,8 +8,8 @@ from genai_agentic_sandbox import prompts
 from genai_agentic_sandbox.agent import (
     MAIN_MEMORY,
     SUBAGENT_MEMORY,
-    build_subagents,
     create_jobhunter_agent,
+    declarative_specs,
 )
 from genai_agentic_sandbox.main import SKILLS_DIR, prepare_resume, sandbox_mounts
 from genai_agentic_sandbox.memory import (
@@ -136,8 +136,8 @@ def test_normal_work_is_not_blocked(command):
 
 
 def test_every_agent_has_the_guard(model):
-    subagents = build_subagents(model, DockerSandboxBackend(), [])
-    for s in subagents:
+    subagents = declarative_specs(model, DockerSandboxBackend(), [])
+    for s in subagents.values():
         [guard] = [m for m in s["middleware"] if isinstance(m, MemoryGuardMiddleware)]
         assert guard.read_only is True, s["name"]
     graph = create_jobhunter_agent(
@@ -168,8 +168,11 @@ def test_which_agent_loads_what():
 
 
 def test_subagents_get_read_only_memory(model):
-    subagents = {s["name"]: s for s in build_subagents(model, DockerSandboxBackend(), [])}
+    subagents = declarative_specs(model, DockerSandboxBackend(), [])
     for name, sources in SUBAGENT_MEMORY.items():
+        if name not in subagents:  # job-optimizer is compiled; it loads no memory
+            assert sources == []
+            continue
         memory = [m for m in subagents[name]["middleware"] if isinstance(m, MemoryMiddleware)]
         if sources:
             [mw] = memory
@@ -180,7 +183,7 @@ def test_subagents_get_read_only_memory(model):
 
 
 def test_memory_off(model):
-    subagents = build_subagents(model, DockerSandboxBackend(), [], memory=False)
+    subagents = list(declarative_specs(model, DockerSandboxBackend(), [], memory=False).values())
     assert not any(isinstance(m, MemoryMiddleware) for s in subagents for m in s["middleware"])
     graph = create_jobhunter_agent(
         model=model,

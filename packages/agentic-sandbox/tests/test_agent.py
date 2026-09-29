@@ -16,9 +16,11 @@ from genai_agentic_sandbox.agent import (
     RESUME_BUILDER_SKILLS,
     SKILLS_MOUNT,
     SUBAGENT_MEMORY,
+    build_job_optimizer,
     build_subagents,
     create_jobhunter_agent,
     extra_middleware,
+    optimizer_subagents,
 )
 from genai_agentic_sandbox.caching import OpenAIPromptCachingMiddleware
 from genai_agentic_sandbox.main import SKILLS_DIR
@@ -58,7 +60,13 @@ def backend():
 
 @pytest.fixture
 def subagents(model, backend):
-    return {s["name"]: s for s in build_subagents(model, backend, BROWSER_TOOLS)}
+    """Every declarative agent spec: the orchestrator's (job-search, job-matcher,
+    ats-reviewer) and the job-optimizer's own resume-builder."""
+    top = {
+        s["name"]: s for s in build_subagents(model, backend, BROWSER_TOOLS) if "runnable" not in s
+    }
+    nested = {s["name"]: s for s in optimizer_subagents(model, backend)}
+    return {**top, "resume-builder": nested["resume-builder"]}
 
 
 def tool_names(tools) -> set[str]:
@@ -87,8 +95,24 @@ def test_extra_middleware_instances_are_not_shared(model, backend):
 # -- subagents -----------------------------------------------------------------------------
 
 
-def test_four_subagents(subagents):
-    assert set(subagents) == {"job-search", "job-matcher", "resume-builder", "ats-reviewer"}
+def test_agent_tree(model, backend):
+    top = [s["name"] for s in build_subagents(model, backend, BROWSER_TOOLS)]
+    assert top == ["job-search", "job-matcher", "job-optimizer", "ats-reviewer"]
+    nested = [s["name"] for s in optimizer_subagents(model, backend)]
+    assert nested == ["resume-builder", "ats-reviewer"]
+
+
+def test_job_optimizer_is_a_deep_agent_with_its_own_subagents(model, backend):
+    optimizer = build_job_optimizer(model, backend, target_score=90, max_rounds=4)
+    assert optimizer["name"] == "job-optimizer" and "runnable" in optimizer
+    assert "ALL in the same message" in optimizer["description"]
+    graph = optimizer["runnable"]
+    tools = graph.nodes["tools"].bound.tools_by_name
+    assert {"task", "write_todos", "compact_conversation", "execute", "read_file"} <= set(tools)
+    task = tools["task"].description
+    assert "- resume-builder:" in task and "- ats-reviewer:" in task
+    assert "TodoCompletionMiddleware.after_model" in graph.nodes
+    assert "SkillsMiddleware.before_agent" in graph.nodes
 
 
 def test_job_search_gets_browser_tools_only(subagents):
@@ -151,7 +175,7 @@ def test_main_agent_tools(model, backend):
     # The browser belongs to the job-search subagent, not the orchestrator.
     assert "browser_navigate" not in tools
     task = tools["task"].description
-    for name in ("job-search", "job-matcher", "resume-builder", "ats-reviewer"):
+    for name in ("job-search", "job-matcher", "job-optimizer", "ats-reviewer"):
         assert f"- {name}:" in task
 
 
@@ -222,7 +246,7 @@ def test_subagent_prompts_are_code_first(prompt):
 def test_file_contract_is_consistent():
     orch = SKILLS_DIR / "orchestrator"
     workflow = (orch / "jobhunt-workflow" / "SKILL.md").read_text()
-    loop = (orch / "resume-optimization" / "SKILL.md").read_text()
+    loop = (SKILLS_DIR / "optimizer" / "job-optimization-loop" / "SKILL.md").read_text()
     resume_skill = (SKILLS_DIR / "resume" / "docx-tracked-revisions" / "SKILL.md").read_text()
     matcher_skill = (SKILLS_DIR / "matching" / "ats-resume-review" / "SKILL.md").read_text()
     assert prompts.JOBS_FILE in workflow and prompts.MATCH_REPORT in workflow
@@ -273,7 +297,7 @@ def test_run_settings_reach_the_orchestrator():
     assert "run the `output-cleanup` skill as the last step" in prompt
     keep = prompts.jobhunter_prompt("/input/cv.docx", cleanup=False)
     assert "do NOT run `output-cleanup`" in keep
-    loop = (SKILLS_DIR / "orchestrator" / "resume-optimization" / "SKILL.md").read_text()
+    loop = (SKILLS_DIR / "optimizer" / "job-optimization-loop" / "SKILL.md").read_text()
     assert "ats/round-<k>.json" in loop and "best_round" in loop
 
 

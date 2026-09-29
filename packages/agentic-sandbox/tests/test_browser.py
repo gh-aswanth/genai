@@ -7,7 +7,7 @@ import shutil
 from unittest import mock
 
 import pytest
-from genai_agentic_sandbox.agent import build_subagents
+from genai_agentic_sandbox.agent import declarative_specs
 from genai_agentic_sandbox.sandbox.docker import DockerSandboxBackend
 from genai_agentic_sandbox.tools import browser
 from genai_agentic_sandbox.tools.browser import (
@@ -131,9 +131,9 @@ def test_host_file_tools_are_dropped(tmp_path):
 def test_only_job_search_has_the_guard():
     subagents = {
         s["name"]: s
-        for s in build_subagents(
+        for s in declarative_specs(
             ChatOpenAI(model="gpt-5.5", api_key="x"), DockerSandboxBackend(), []
-        )
+        ).values()
     }
     guarded = {
         n

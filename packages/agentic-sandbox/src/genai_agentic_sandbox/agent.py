@@ -1,12 +1,13 @@
-"""JobHunter: a Deep Agent with three subagents, running on a Docker sandbox.
+"""JobHunter: a Deep Agent with subagents, running on a Docker sandbox.
 
-    jobhunter (main)
-    ├── job-search      Playwright MCP browser tools -> /output/jobs/jobs.json
-    ├── job-matcher     resume + jobs -> ATS review, required skills, change list
-    ├── resume-builder  per selected job and round: colour-coded redline, tracked
-    │                   review and clean final copy of the resume
-    └── ats-reviewer    per selected job and round: fixed ATS score + feedback;
-                        the orchestrator loops builder <-> reviewer until done
+    jobhunter (main, orchestrator)
+    ├── job-search       Playwright MCP browser tools -> /output/jobs/jobs.json
+    ├── job-matcher      resume + jobs -> ATS review, selected jobs, change lists
+    ├── job-optimizer    ONE PER SELECTED JOB, all launched in one message and
+    │   │                running in parallel; each owns its job's whole loop:
+    │   ├── resume-builder   round k: colour-coded redline, tracked review, clean final
+    │   └── ats-reviewer     round k: fixed ATS score + feedback -> next round or done
+    └── ats-reviewer     score-only workflow (the user's resume as it is)
 
 Middleware
 ----------
@@ -56,12 +57,12 @@ and every agent routes its calls to its own OpenAI prompt cache.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from deepagents import create_deep_agent
 from deepagents.backends.protocol import SandboxBackendProtocol
-from deepagents.middleware.subagents import SubAgent
+from deepagents.middleware.subagents import CompiledSubAgent, SubAgent
 from deepagents.middleware.summarization import create_summarization_tool_middleware
 from langchain.agents.middleware import AgentMiddleware, TodoListMiddleware
 from langchain_core.language_models import BaseChatModel
@@ -86,6 +87,7 @@ from genai_agentic_sandbox.prompts import (
     JOB_MATCHER_PROMPT,
     JOB_SEARCH_PROMPT,
     RESUME_BUILDER_PROMPT,
+    job_optimizer_prompt,
     jobhunter_prompt,
 )
 from genai_agentic_sandbox.tools.browser import BrowserFileGuardMiddleware
@@ -96,6 +98,7 @@ JOB_SEARCH_SKILLS = [f"{SKILLS_MOUNT}/search/"]
 JOB_MATCHER_SKILLS = [f"{SKILLS_MOUNT}/matching/"]
 RESUME_BUILDER_SKILLS = [f"{SKILLS_MOUNT}/resume/"]
 ATS_REVIEWER_SKILLS = [f"{SKILLS_MOUNT}/ats/"]
+JOB_OPTIMIZER_SKILLS = [f"{SKILLS_MOUNT}/optimizer/"]
 
 # Long-term memory each agent loads (the reviewer none: independent scores).
 MAIN_MEMORY = [USER_PROFILE, AGENT_NOTES]
@@ -104,6 +107,7 @@ SUBAGENT_MEMORY = {
     "job-matcher": [USER_PROFILE],
     "resume-builder": [USER_PROFILE],
     "ats-reviewer": [],
+    "job-optimizer": [],
 }
 
 
@@ -114,6 +118,7 @@ PLAN_BEFORE = {
     "job-matcher": ("execute", "write_file", "edit_file"),
     "resume-builder": ("execute", "write_file", "edit_file"),
     "ats-reviewer": ("execute", "write_file", "edit_file"),
+    "job-optimizer": ("task", "execute", "write_file", "edit_file"),
 }
 
 
@@ -147,6 +152,111 @@ def extra_middleware(
     return stack
 
 
+def _middleware_factory(
+    model: BaseChatModel,
+    backend: SandboxBackendProtocol,
+    cache_retention: CacheRetention | None,
+    memory: bool,
+) -> Callable[[str], list[AgentMiddleware]]:
+    def mw(agent: str) -> list[AgentMiddleware]:
+        sources = SUBAGENT_MEMORY.get(agent) if memory else None
+        return extra_middleware(
+            model, backend, agent, cache_retention=cache_retention, memory=sources
+        )
+
+    return mw
+
+
+def _resume_builder_spec(mw: Callable[[str], list[AgentMiddleware]]) -> SubAgent:
+    return {
+        "name": "resume-builder",
+        "description": (
+            "Builds ONE tailored resume for ONE selected job and ONE round: from the "
+            "original resume, applies that job's changes (and, from round 2, the ATS "
+            "feedback) as colour-coded tracked changes with comments, writing redline, "
+            "review and final copies to /output/resume/<rank>-<slug>/v<k>/. Give it the "
+            "resume path, job id/rank/slug, round k, folder and feedback file."
+        ),
+        "system_prompt": RESUME_BUILDER_PROMPT,
+        "tools": [],
+        "skills": RESUME_BUILDER_SKILLS,
+        "middleware": mw("resume-builder"),
+    }
+
+
+def _ats_reviewer_spec(mw: Callable[[str], list[AgentMiddleware]]) -> SubAgent:
+    return {
+        "name": "ats-reviewer",
+        "description": (
+            "Independently scores ONE resume for ONE job like an ATS - fixed reproducible "
+            "scoring script plus a quality review. Loop mode: a round's *_final.docx -> "
+            "/output/resume/<rank>-<slug>/ats/round-<k>.json (score, issues, verdict). "
+            "Score-only mode: the user's resume as is -> /output/ats/<slug>/round-1.json. "
+            "Give it the mode, job id/rank/slug, round k, target score and the .docx path."
+        ),
+        "system_prompt": ATS_REVIEWER_PROMPT,
+        "tools": [],
+        "skills": ATS_REVIEWER_SKILLS,
+        "middleware": mw("ats-reviewer"),
+    }
+
+
+def optimizer_subagents(
+    model: BaseChatModel,
+    backend: SandboxBackendProtocol,
+    *,
+    cache_retention: CacheRetention | None = None,
+    memory: bool = True,
+) -> list[SubAgent]:
+    """The job-optimizer's own subagents: resume-builder and ats-reviewer."""
+    mw = _middleware_factory(model, backend, cache_retention, memory)
+    return [_resume_builder_spec(mw), _ats_reviewer_spec(mw)]
+
+
+def build_job_optimizer(
+    model: BaseChatModel,
+    backend: SandboxBackendProtocol,
+    *,
+    cache_retention: CacheRetention | None = None,
+    memory: bool = True,
+    target_score: float = DEFAULT_TARGET_SCORE,
+    max_rounds: int = DEFAULT_MAX_ROUNDS,
+) -> CompiledSubAgent:
+    """One job's whole builder <-> reviewer loop, as a subagent of its own.
+
+    The orchestrator launches one per selected job in a single message, so every
+    job's loop runs concurrently instead of the orchestrator stepping the jobs
+    round by round.
+    """
+    runnable = create_deep_agent(
+        model=model,
+        tools=[],
+        system_prompt=job_optimizer_prompt(target_score, max_rounds),
+        subagents=optimizer_subagents(
+            model, backend, cache_retention=cache_retention, memory=memory
+        ),
+        skills=JOB_OPTIMIZER_SKILLS,
+        backend=backend,
+        middleware=extra_middleware(
+            model, backend, "job-optimizer", cache_retention=cache_retention
+        ),
+        name="job-optimizer",
+    )
+    return {
+        "name": "job-optimizer",
+        "description": (
+            "Runs the WHOLE resume-optimisation loop for ONE selected job on its own: "
+            "resume-builder round -> ats-reviewer score -> repeat until the target score, "
+            "no more gain, or the round limit -> copy the best round's redline / review / "
+            "final .docx into /output/resume/<rank>-<slug>/ and write ats_history.json. "
+            "Launch one per selected job, ALL in the same message, so the jobs run in "
+            "parallel. Give it the resume path, the job id / rank / title / company / slug "
+            "and its folder."
+        ),
+        "runnable": runnable,
+    }
+
+
 def build_subagents(
     model: BaseChatModel,
     backend: SandboxBackendProtocol,
@@ -154,20 +264,18 @@ def build_subagents(
     *,
     cache_retention: CacheRetention | None = None,
     memory: bool = True,
-) -> list[SubAgent]:
-    """The three specialist subagents.
+    target_score: float = DEFAULT_TARGET_SCORE,
+    max_rounds: int = DEFAULT_MAX_ROUNDS,
+) -> list[SubAgent | CompiledSubAgent]:
+    """The orchestrator's subagents: job-search, job-matcher, job-optimizer, ats-reviewer.
 
     Each gets the deep-agent built-ins (filesystem tools + `execute` in the
     sandbox). `tools` is set explicitly so nothing is inherited implicitly:
     job-search adds the browser, the others need nothing beyond code execution.
+    job-optimizer is a deep agent itself (resume-builder + ats-reviewer); the
+    orchestrator keeps ats-reviewer for the score-only workflow.
     """
-
-    def mw(agent: str) -> list[AgentMiddleware]:
-        sources = SUBAGENT_MEMORY[agent] if memory else None
-        return extra_middleware(
-            model, backend, agent, cache_retention=cache_retention, memory=sources
-        )
-
+    mw = _middleware_factory(model, backend, cache_retention, memory)
     return [
         {
             "name": "job-search",
@@ -195,35 +303,35 @@ def build_subagents(
             "skills": JOB_MATCHER_SKILLS,
             "middleware": mw("job-matcher"),
         },
-        {
-            "name": "resume-builder",
-            "description": (
-                "Builds ONE tailored resume for ONE selected job and ONE round: from the "
-                "original resume, applies that job's changes (and, from round 2, the ATS "
-                "feedback) as colour-coded tracked changes with comments, writing redline, "
-                "review and final copies to /output/resume/<rank>-<slug>/v<k>/. Give it the "
-                "resume path, job id/rank/slug, round k, folder and feedback file."
-            ),
-            "system_prompt": RESUME_BUILDER_PROMPT,
-            "tools": [],
-            "skills": RESUME_BUILDER_SKILLS,
-            "middleware": mw("resume-builder"),
-        },
-        {
-            "name": "ats-reviewer",
-            "description": (
-                "Independently scores ONE round's tailored resume (the *_final.docx) for ONE "
-                "job like an ATS - fixed reproducible scoring script plus a quality review - "
-                "and writes /output/resume/<rank>-<slug>/ats/round-<k>.json with score, "
-                "actionable issues and verdict (done/improve). Give it the job id/rank/slug, "
-                "round k, target score and the final .docx path."
-            ),
-            "system_prompt": ATS_REVIEWER_PROMPT,
-            "tools": [],
-            "skills": ATS_REVIEWER_SKILLS,
-            "middleware": mw("ats-reviewer"),
-        },
+        build_job_optimizer(
+            model,
+            backend,
+            cache_retention=cache_retention,
+            memory=memory,
+            target_score=target_score,
+            max_rounds=max_rounds,
+        ),
+        _ats_reviewer_spec(mw),
     ]
+
+
+def declarative_specs(
+    model: BaseChatModel,
+    backend: SandboxBackendProtocol,
+    browser_tools: Sequence[BaseTool] = (),
+    *,
+    memory: bool = True,
+) -> dict[str, SubAgent]:
+    """Every declarative agent spec at every level, by name: the orchestrator's
+    (job-search, job-matcher, ats-reviewer) and the job-optimizer's resume-builder.
+    (The job-optimizer itself is compiled; it is not in this map.)"""
+    top = [
+        s
+        for s in build_subagents(model, backend, browser_tools, memory=memory)
+        if "runnable" not in s
+    ]
+    nested = optimizer_subagents(model, backend, memory=memory)
+    return {**{s["name"]: s for s in nested}, **{s["name"]: s for s in top}}
 
 
 def create_jobhunter_agent(
@@ -269,7 +377,13 @@ def create_jobhunter_agent(
             resume_path, top_jobs, target_score, max_rounds, cleanup, memory=memory
         ),
         subagents=build_subagents(
-            model, backend, browser_tools, cache_retention=cache_retention, memory=memory
+            model,
+            backend,
+            browser_tools,
+            cache_retention=cache_retention,
+            memory=memory,
+            target_score=target_score,
+            max_rounds=max_rounds,
         ),
         skills=MAIN_SKILLS,
         memory=MAIN_MEMORY if memory else None,
@@ -291,7 +405,10 @@ __all__ = [
     "RESUME_BUILDER_SKILLS",
     "SKILLS_MOUNT",
     "SUBAGENT_MEMORY",
+    "build_job_optimizer",
     "build_subagents",
     "create_jobhunter_agent",
+    "declarative_specs",
     "extra_middleware",
+    "optimizer_subagents",
 ]
