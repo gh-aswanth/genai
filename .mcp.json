@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "langchain-docs": {
+      "type": "http",
+      "url": "https://docs.langchain.com/mcp"
+    },
+     "openai-developer-docs": {
+      "type": "http",
+      "url": "https://developers.openai.com/mcp"
+    }
+  }
+}
